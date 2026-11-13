@@ -1,0 +1,13 @@
+.temp/
+.task-board/
+.DS_Store
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/swarma-lease
+.agents/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/swarma-lease
+.local/
