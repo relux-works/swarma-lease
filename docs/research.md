@@ -10,7 +10,7 @@ Choose a first implementation path for a local resource registry and lease queue
 
 Build a small Go module with a single local service, a durable SQLite store, and a CLI that waits over a local Unix-domain socket. Keep one exact tag per resource, one stable resource ID, one resource per request, a durable sequence number per tag queue, and a fixed hard end. Do not add priorities, multi-resource requests, capability queries, heartbeats, or distributed consensus in the first slice.
 
-For the first Mac integration, register explicit Go and Swift test-slot IDs under separate tags. A blocking request names the tag and duration; the service grants the oldest queued request one available ID, returns the lease details, and releases the resource on explicit release or at the hard end after safe cleanup. A command wrapper should run the protected build/test command and stop it at expiry. Until that wrapper and the configured pool are accepted, the existing slot gate remains in force.
+For the first Mac integration, use the manual-pool service slice in the [MVP contract](contract.md); it supports blocking FIFO requests and release but does not execute build/test commands. The default Go and Swift test pools remain command-mode and refuse raw requests with `adapter_required`. A later command adapter must implement the hard-end stop and cleanup contract before those pools open, so the existing hand-granted slot gate stays in force until that adapter and the configured pool are accepted.
 
 The first slice should use SQLite transactions for state changes and a local socket for request/notification. SQLite provides serializable transactions with one writer at a time. Its WAL mode can let readers and a writer proceed concurrently, but WAL requires all database users to be on one host, so it is suitable for a local file and unsuitable as a multi-host shared database. Keep the store behind a small backend interface; choose a central linearizable service only when multi-host leasing is actually scheduled.
 
@@ -37,22 +37,21 @@ The first slice should use SQLite transactions for state changes and a local soc
 ## Implications
 
 1. Keep fairness explicit: assign each accepted waiter a durable sequence number and allocate only from the head of that tag's FIFO queue. No priority or newest-first mode in the MVP.
-2. A lease expiry changes the holder's entitlement; it does not magically stop a command or reset a physical device. The first Mac adapter must supervise the command through expiry. A device adapter that cannot prove cleanup must quarantine the device rather than hand it to the next waiter.
+2. A lease expiry changes the holder's entitlement; it does not magically stop a command or reset a physical device. The later command adapter must supervise the command through expiry. A device adapter that cannot prove cleanup must quarantine the device rather than hand it to the next waiter.
 3. Use one local service as the queue authority. Clients block on a socket response; they do not poll the database or sleep-loop looking for a free slot.
 4. Preserve the queue sequence and active hard-end timestamps in durable storage. On restart, restore the queue, expire overdue leases, and never issue a lease when storage state is uncertain.
 5. Multi-host allocation needs a new decision: a central strongly consistent backend and monotonically increasing fencing tokens. A SQLite WAL file on a network share is not an acceptable shortcut.
 
 ## First production slice
 
-Implement the Go CLI and service for a single host, then exercise one real `mac.go-test` pool end to end: register a resource ID, block a requester without polling, grant exactly one ID, run a Go test command under the lease, release on normal exit, and stop/reclaim it at the hard end. Add Swift test slots by registering another tag and IDs, not by adding a second scheduling path. This is implementation work for a later unit; this research phase creates no production code and runs no Go or Swift build.
+Implement the first slice in the [MVP contract](contract.md): a single-host Go service and CLI with SQLite, a local socket, manual pools, FIFO wait, release, hard ends, restart recovery, and audit/status. It does not execute commands. The default Mac test pools remain command-mode and refuse raw requests with `adapter_required`. The later `lease run` slice may supervise the command pools only after a separate reviewed process identity, descendant-discovery, and cleanup contract is accepted. This research phase creates no production code and runs no Go or Swift build.
 
 ## Open questions for the product owner
 
-- What exact number of initial Go and Swift slots may the first host register, and which stable tags and IDs should be used?
-- Should the first `run` adapter terminate a command at the hard end, and what cleanup evidence is required before a resource becomes available again?
-- Do all current callers share one macOS user account? If not, which local OS users may access the service and its database/socket?
-- What is the maximum time a request may wait in the queue? The request lease duration and the queue wait timeout should be separate required inputs.
-- When multi-host support becomes a scheduled requirement, which service will own the linearizable global allocation state?
+First-host decisions are settled in the [MVP contract](contract.md): one `go-test-01` resource under `mac.go-test`, one `swift-test-01` resource under `mac.swift-test`, one configured macOS user, a 20-minute maximum lease, a 30-minute maximum queue wait, and no resource reuse until command/descendant stop and cleanup are confirmed.
+
+- Which exact process-identity and descendant-stopping method should the later `lease run` contract use, including reparented descendants and cleanup failure recovery?
+- When multi-host support is scheduled, which central linearizable backend should own global allocation state and fencing tokens?
 
 ## Sources
 
