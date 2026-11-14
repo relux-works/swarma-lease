@@ -181,9 +181,9 @@ func TestInvalidDatabasePreservesProvenStaleSocket(t *testing.T) {
 
 func snapshotCanonicalTables(t *testing.T, dbPath string) map[string][]sqlite.Row {
 	t.Helper()
-	db, err := sqlite.Open(dbPath)
+	db, err := sqlite.OpenReadOnly(dbPath)
 	if err != nil {
-		t.Fatalf("open database for independent table snapshot: %v", err)
+		t.Fatalf("open database read-only for independent table snapshot: %v", err)
 	}
 	defer db.Close()
 	tables := []struct {

@@ -21,22 +21,23 @@ import (
 const maxFrameBytes = 65536
 
 type Server struct {
-	stateDir   string
-	socketPath string
-	ownerUID   int64
-	clock      Clock
-	store      *Store
-	listener   *net.UnixListener
-	lockFile   *os.File
-	socketInfo os.FileInfo
-	mu         sync.Mutex
-	active     map[net.Conn]struct{}
-	workers    sync.WaitGroup
-	closing    bool
-	closeOnce  sync.Once
-	doneOnce   sync.Once
-	done       chan struct{}
-	closeErr   error
+	stateDir          string
+	socketPath        string
+	ownerUID          int64
+	clock             Clock
+	store             *Store
+	listener          *net.UnixListener
+	lockFile          *os.File
+	socketInfo        os.FileInfo
+	staleSocketBackup staleSocketBackup
+	mu                sync.Mutex
+	active            map[net.Conn]struct{}
+	workers           sync.WaitGroup
+	closing           bool
+	closeOnce         sync.Once
+	doneOnce          sync.Once
+	done              chan struct{}
+	closeErr          error
 }
 
 // POSIX access(2) permission bits; syscall does not export these on Darwin.
@@ -46,6 +47,10 @@ const (
 )
 
 func Start(config Config) (*Server, error) {
+	return startWithSocketRemoval(config, os.Remove)
+}
+
+func startWithSocketRemoval(config Config, removeSocket func(string) error) (*Server, error) {
 	uid := os.Geteuid()
 	if uid == 0 {
 		return nil, errUnsafePath
@@ -98,6 +103,7 @@ func Start(config Config) (*Server, error) {
 		return nil, err
 	}
 	var staleSocketInfo os.FileInfo
+	var staleBackup staleSocketBackup
 	if info, err := os.Lstat(socketPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
 			unlockClose(lockFile)
@@ -132,27 +138,52 @@ func Start(config Config) (*Server, error) {
 			unlockClose(lockFile)
 			return nil, err
 		}
-		if err := removeProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid)); err != nil {
+		backup, err := backupProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid))
+		if err != nil {
+			unlockClose(lockFile)
+			return nil, err
+		}
+		staleBackup = backup
+		if err := removeProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid), removeSocket); err != nil {
+			if cleanupErr := cleanupStaleSocketBackup(staleBackup, uint32(uid)); cleanupErr != nil {
+				unlockClose(lockFile)
+				return nil, errUnsafePath
+			}
 			unlockClose(lockFile)
 			return nil, err
 		}
 	}
 	store, err := openStore(stateDir, int64(uid), clock)
 	if err != nil {
+		if err := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); err != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, err
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
 	listener.SetUnlinkOnClose(false)
 	boundInfo, err := os.Lstat(socketPath)
 	if err != nil || boundInfo.Mode()&os.ModeSocket == 0 || boundInfo.Mode()&os.ModeSymlink != 0 {
+		if err == nil {
+			_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
+		}
 		_ = listener.Close()
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
@@ -160,6 +191,10 @@ func Start(config Config) (*Server, error) {
 		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errBadMode
 	}
@@ -168,6 +203,10 @@ func Start(config Config) (*Server, error) {
 		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
@@ -176,6 +215,10 @@ func Start(config Config) (*Server, error) {
 		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
@@ -183,10 +226,18 @@ func Start(config Config) (*Server, error) {
 		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
+		if restoreErr := restoreStaleSocketBackup(socketPath, staleBackup, uint32(uid)); restoreErr != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 		unlockClose(lockFile)
 		return nil, errBadMode
 	}
-	return &Server{stateDir: stateDir, socketPath: socketPath, ownerUID: int64(uid), clock: clock, store: store, listener: listener, lockFile: lockFile, socketInfo: socketInfo, active: make(map[net.Conn]struct{}), done: make(chan struct{})}, nil
+	server := &Server{stateDir: stateDir, socketPath: socketPath, ownerUID: int64(uid), clock: clock, store: store, listener: listener, lockFile: lockFile, socketInfo: socketInfo, staleSocketBackup: staleBackup, active: make(map[net.Conn]struct{}), done: make(chan struct{})}
+	if err := cleanupStaleSocketBackup(server.staleSocketBackup, uint32(uid)); err == nil {
+		server.staleSocketBackup = staleSocketBackup{}
+	}
+	return server, nil
 }
 
 func proveStaleSocket(path string, original os.FileInfo, uid uint32) error {
@@ -209,14 +260,134 @@ func proveStaleSocket(path string, original os.FileInfo, uid uint32) error {
 	return nil
 }
 
-func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) error {
+func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32, removeSocket func(string) error) error {
 	if err := proveStaleSocket(path, original, uid); err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil {
+	if err := removeSocket(path); err != nil {
 		return errors.New("socket_stale_uncertain")
 	}
 	return nil
+}
+
+const staleSocketBackupDirPrefix = ".swarma-lease-stale-"
+
+type staleSocketBackup struct {
+	dir     string
+	dirInfo os.FileInfo
+	path    string
+	info    os.FileInfo
+}
+
+func backupProvenStaleSocket(path string, original os.FileInfo, uid uint32) (staleSocketBackup, error) {
+	dir, err := os.MkdirTemp(filepath.Dir(path), staleSocketBackupDirPrefix)
+	if err != nil {
+		return staleSocketBackup{}, errors.New("socket_stale_uncertain")
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		_ = os.Remove(dir)
+		return staleSocketBackup{}, errors.New("socket_stale_uncertain")
+	}
+	dirInfo, err := os.Lstat(dir)
+	dirStat, ok := (*syscall.Stat_t)(nil), false
+	if err == nil {
+		dirStat, ok = dirInfo.Sys().(*syscall.Stat_t)
+	}
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 || dirInfo.Mode().Perm() != 0700 || !ok || dirStat.Uid != uid {
+		_ = os.Remove(dir)
+		return staleSocketBackup{}, errUnsafePath
+	}
+
+	backupPath := filepath.Join(dir, "service.sock")
+	if err := os.Link(path, backupPath); err != nil {
+		_ = os.Remove(dir)
+		return staleSocketBackup{}, errors.New("socket_stale_uncertain")
+	}
+	backupInfo, err := os.Lstat(backupPath)
+	currentInfo, currentErr := os.Lstat(path)
+	if err != nil || currentErr != nil || !sameOwnedSocket(backupInfo, original, uid) || !sameOwnedSocket(currentInfo, original, uid) {
+		if err == nil && sameOwnedSocket(backupInfo, original, uid) {
+			_ = os.Remove(backupPath)
+		}
+		_ = os.Remove(dir)
+		return staleSocketBackup{}, errors.New("socket_stale_uncertain")
+	}
+	return staleSocketBackup{dir: dir, dirInfo: dirInfo, path: backupPath, info: backupInfo}, nil
+}
+
+func sameOwnedSocket(current, expected os.FileInfo, uid uint32) bool {
+	if current == nil || expected == nil || !os.SameFile(expected, current) || current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 || current.Mode().Perm() != 0600 {
+		return false
+	}
+	stat, ok := current.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uid
+}
+
+func restoreStaleSocketBackup(socketPath string, backup staleSocketBackup, uid uint32) error {
+	if backup.path == "" {
+		return nil
+	}
+	if !sameOwnedStaleSocketBackupDir(backup.dir, backup.dirInfo, uid) {
+		return errUnsafePath
+	}
+	backupInfo, err := os.Lstat(backup.path)
+	if err != nil || !sameOwnedSocket(backupInfo, backup.info, uid) {
+		return errUnsafePath
+	}
+	if _, err := os.Lstat(socketPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return errUnsafePath
+	}
+	if err := os.Link(backup.path, socketPath); err != nil {
+		return errUnsafePath
+	}
+	restoredInfo, err := os.Lstat(socketPath)
+	if err != nil || !sameOwnedSocket(restoredInfo, backup.info, uid) {
+		return errUnsafePath
+	}
+	return cleanupStaleSocketBackup(backup, uid)
+}
+
+func cleanupStaleSocketBackup(backup staleSocketBackup, uid uint32) error {
+	if backup.path == "" {
+		return nil
+	}
+	dirInfo, dirErr := os.Lstat(backup.dir)
+	if errors.Is(dirErr, os.ErrNotExist) {
+		if _, err := os.Lstat(backup.path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errUnsafePath
+	}
+	if dirErr != nil || !sameOwnedStaleSocketBackupDir(backup.dir, backup.dirInfo, uid) {
+		return errUnsafePath
+	}
+	current, err := os.Lstat(backup.path)
+	if err == nil {
+		if !sameOwnedSocket(current, backup.info, uid) {
+			return errUnsafePath
+		}
+		if err := os.Remove(backup.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errUnsafePath
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errUnsafePath
+	}
+	if err := os.Remove(backup.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errUnsafePath
+	}
+	return nil
+}
+
+func sameOwnedStaleSocketBackupDir(path string, expected os.FileInfo, uid uint32) bool {
+	if expected == nil {
+		return false
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(expected, current) || !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || current.Mode().Perm() != 0700 {
+		return false
+	}
+	stat, ok := current.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uid
 }
 
 func removeOwnedSocket(path string, expected os.FileInfo, uid uint32) error {
@@ -651,6 +822,9 @@ func (s *Server) Close() error {
 		s.stopServing()
 		s.workers.Wait()
 		if err := removeOwnedSocket(s.socketPath, s.socketInfo, uint32(s.ownerUID)); err != nil {
+			s.closeErr = errors.New("unsafe_state_path")
+		}
+		if err := cleanupStaleSocketBackup(s.staleSocketBackup, uint32(s.ownerUID)); err != nil && s.closeErr == nil {
 			s.closeErr = errors.New("unsafe_state_path")
 		}
 		if s.store != nil {
