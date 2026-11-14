@@ -351,7 +351,7 @@ func cleanupStaleSocketBackup(backup staleSocketBackup, uid uint32) error {
 	if backup.path == "" {
 		return nil
 	}
-	dirInfo, dirErr := os.Lstat(backup.dir)
+	_, dirErr := os.Lstat(backup.dir)
 	if errors.Is(dirErr, os.ErrNotExist) {
 		if _, err := os.Lstat(backup.path); errors.Is(err, os.ErrNotExist) {
 			return nil
