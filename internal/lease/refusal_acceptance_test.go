@@ -2,8 +2,10 @@ package lease
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -79,7 +81,7 @@ func TestEarlyVersionRefusalsPreserveOnlyValidRequestKeys(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			response, fields := exchangeRawServiceRequest(t, server, tc.raw)
-			if response.Version != 1 || response.Type != "response" || response.Op != tc.op || response.State != "error" || response.Code != tc.code || len(response.Data) != 0 {
+			if response.Version != 1 || response.Type != "response" || response.Op != tc.op || response.State != "error" || response.Code != tc.code || response.Data == nil || len(response.Data) != 0 {
 				t.Fatalf("response = %#v, want op=%s code=%s with empty data", response, tc.op, tc.code)
 			}
 			if tc.wantRequestID {
@@ -122,6 +124,65 @@ func TestEarlyVersionRefusalsPreserveOnlyValidRequestKeys(t *testing.T) {
 	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"version-control","data":{"tag":"qa.version","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
 	if granted.State != "granted" || granted.Code != "" || granted.RequestID != "version-control" || granted.Data["lease"] == nil || granted.Data["resource"] == nil {
 		t.Fatalf("valid acquisition control = %#v, want granted lease and resource", granted)
+	}
+}
+
+// TestStateDependentRefusalsSerializeEmptyObjects proves six management refusals emit exact data:{} frames and leave audit state untouched, while a matching valid add/acquire control still succeeds.
+func TestStateDependentRefusalsSerializeEmptyObjects(t *testing.T) {
+	server := newTestServer(t)
+	added, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`)
+	if added.State != "added" || added.Code != "" {
+		t.Fatalf("resource setup = %#v, want added", added)
+	}
+	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-holder","data":{"tag":"qa.refusal","duration_ns":60000000000,"wait_mode":"no_wait"}}`)
+	if granted.State != "granted" || granted.Code != "" {
+		t.Fatalf("active resource setup = %#v, want grant", granted)
+	}
+
+	cases := []struct {
+		name, raw, op, code string
+	}{
+		{"duplicate-resource", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`, "resource.add", "duplicate_resource_id"},
+		{"pool-mode-mismatch", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-02","mode":"command"}}`, "resource.add", "pool_mode_mismatch"},
+		{"unknown-resource-disable", `{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":"missing-resource"}}`, "resource.disable", "unknown_resource"},
+		{"unknown-resource-enable", `{"version":1,"type":"request","op":"resource.enable","data":{"resource_id":"missing-resource"}}`, "resource.enable", "unknown_resource"},
+		{"unknown-lease-release", `{"version":1,"type":"request","op":"lease.release","data":{"lease_id":"00000000000000000000000000000002"}}`, "lease.release", "unknown_lease"},
+		{"invalid-transition", `{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":"refusal-01"}}`, "resource.disable", "invalid_transition"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			beforeState, beforeStateCode := server.store.ServiceStatus()
+			if beforeStateCode != "" {
+				t.Fatalf("pre-refusal state = %s", beforeStateCode)
+			}
+			before := hardEndAuditCount(t, server)
+			got, fields := exchangeRawServiceRequest(t, server, tc.raw)
+			if got.State != "error" || got.Code != tc.code || got.Op != tc.op || got.RequestID != "" || got.Data == nil || len(got.Data) != 0 {
+				t.Fatalf("refusal = %#v, want %s error with a non-nil empty object", got, tc.code)
+			}
+			if !bytes.Equal(fields["data"], []byte("{}")) {
+				t.Fatalf("raw refusal data = %s, want exact {}", fields["data"])
+			}
+			if _, hasRequestID := fields["request_id"]; hasRequestID {
+				t.Fatalf("management refusal reflected request_id in %#v", fields)
+			}
+			if after := hardEndAuditCount(t, server); after != before {
+				t.Fatalf("refusal added audit rows: before=%d after=%d", before, after)
+			}
+			afterState, afterStateCode := server.store.ServiceStatus()
+			if afterStateCode != "" || !reflect.DeepEqual(afterState, beforeState) {
+				t.Fatalf("refusal changed service state: before=%#v after=%#v code=%s", beforeState, afterState, afterStateCode)
+			}
+		})
+	}
+
+	control, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-02","mode":"manual"}}`)
+	if control.State != "added" || control.Code != "" {
+		t.Fatalf("valid resource control = %#v, want added", control)
+	}
+	control, _ = exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-control","data":{"tag":"qa.refusal","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
+	if control.State != "granted" || control.Code != "" || control.RequestID != "refusal-control" {
+		t.Fatalf("valid acquisition control = %#v, want grant", control)
 	}
 }
 

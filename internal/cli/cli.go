@@ -137,6 +137,12 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	if err != nil || !flags.bools["--json"] {
 		return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
 	}
+	safeRequestID := ""
+	if mode == "lease-request" {
+		if candidate := flags.values["--request-id"]; validRequestID(candidate) {
+			safeRequestID = candidate
+		}
+	}
 	data := make(map[string]any)
 	switch mode {
 	case "resource-add":
@@ -171,14 +177,14 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	case "lease-request":
 		tag := flags.values["--tag"]
 		if !validName(tag) {
-			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_tag"}
+			return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_tag"}
 		}
 		duration, err := ParseDuration(flags.values["--duration"])
 		if err != nil {
-			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_duration"}
+			return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_duration"}
 		}
 		if flags.bools["--wait"] == flags.bools["--no-wait"] {
-			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_wait_mode"}
+			return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_wait_mode"}
 		}
 		waitMode := "no_wait"
 		if flags.bools["--wait"] {
@@ -188,11 +194,11 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		if waitMode == "wait" {
 			value, parseErr := ParseDuration(flags.values["--wait-timeout"])
 			if parseErr != nil {
-				return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_wait_timeout"}
+				return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_wait_timeout"}
 			}
 			waitTimeout = &value
 		} else if _, present := flags.values["--wait-timeout"]; present {
-			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_wait_timeout"}
+			return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_wait_timeout"}
 		}
 		requestID := flags.values["--request-id"]
 		if requestID == "" {

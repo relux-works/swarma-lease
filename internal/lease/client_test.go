@@ -85,6 +85,42 @@ func TestExchangeDistinguishesTransportFailures(t *testing.T) {
 	<-serverDone
 }
 
+// TestStatusTransportErrorsPreserveOnlyValidNestedRequestKeys proves a valid request-status key survives local transport failure without becoming a top-level wire key, while invalid or lease-only lookups never reflect a key.
+func TestStatusTransportErrorsPreserveOnlyValidNestedRequestKeys(t *testing.T) {
+	missing := filepath.Join(shortTestDir(t), "missing.sock")
+	valid := WireRequest{Version: 1, Type: "request", Op: "lease.status", Data: map[string]any{"request_id": "status-key"}}
+	if result, code := Exchange(missing, valid); code != "daemon_unavailable" || result.Code != "daemon_unavailable" || result.RequestID != "status-key" {
+		t.Fatalf("valid nested-key transport failure = (%#v, %q), want key status-key", result, code)
+	}
+	invalid := WireRequest{Version: 1, Type: "request", Op: "lease.status", Data: map[string]any{"request_id": "bad key"}}
+	if result, code := Exchange(missing, invalid); code != "daemon_unavailable" || result.Code != "daemon_unavailable" || result.RequestID != "" {
+		t.Fatalf("invalid nested-key transport failure = (%#v, %q), want suppressed key", result, code)
+	}
+	leaseLookup := WireRequest{Version: 1, Type: "request", Op: "lease.status", Data: map[string]any{"lease_id": "00000000000000000000000000000001"}}
+	if result, code := Exchange(missing, leaseLookup); code != "daemon_unavailable" || result.Code != "daemon_unavailable" || result.RequestID != "" {
+		t.Fatalf("lease-id transport failure = (%#v, %q), want no request key", result, code)
+	}
+
+	listener, path := listenTestSocket(t)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		request := readTestRequest(t, conn)
+		if request.RequestID != "" || request.Data.(map[string]any)["request_id"] != "status-key" {
+			t.Errorf("status wire request = %#v, want nested key only", request)
+		}
+	}()
+	if result, code := Exchange(path, valid); code != "result_unknown" || result.Code != "result_unknown" || result.RequestID != "status-key" {
+		t.Fatalf("post-send status failure = (%#v, %q), want nested key status-key", result, code)
+	}
+	<-serverDone
+}
+
 // TestExchangeInterruptionLeavesQueuedWorkUntouched proves interruption after sending a wait request reports unknown attempt state and sends no second frame or implicit cancellation.
 func TestExchangeInterruptionLeavesQueuedWorkUntouched(t *testing.T) {
 	listener, path := listenTestSocket(t)

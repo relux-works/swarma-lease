@@ -376,7 +376,7 @@ func TestUnknownLookupRefusalsKeepCommittedState(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := directRequest(t, server, tc.op, "", map[string]any{tc.idField: tc.id})
-			if got.State != "error" || got.Code != tc.wantCode || got.RequestID != tc.responseID || len(got.Data) != 0 {
+			if got.State != "error" || got.Code != tc.wantCode || got.RequestID != tc.responseID || got.Data == nil || len(got.Data) != 0 {
 				t.Fatalf("missing-target result = %#v, want %s and request_id=%q with empty data", got, tc.wantCode, tc.responseID)
 			}
 		})

@@ -91,37 +91,32 @@ func Start(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := openStore(stateDir, int64(uid), clock)
-	if err != nil {
-		unlockClose(lockFile)
-		return nil, err
-	}
 	if info, err := os.Lstat(socketPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
-			_ = store.Close()
 			unlockClose(lockFile)
 			return nil, errUnsafePath
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok || stat.Uid != uint32(uid) {
-			_ = store.Close()
 			unlockClose(lockFile)
 			return nil, errUnsafePath
 		}
 		if info.Mode().Perm() != 0600 {
-			_ = store.Close()
 			unlockClose(lockFile)
 			return nil, errBadMode
 		}
 		if err := removeProvenStaleSocket(socketPath, info, uint32(uid)); err != nil {
-			_ = store.Close()
 			unlockClose(lockFile)
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		_ = store.Close()
 		unlockClose(lockFile)
 		return nil, errUnsafePath
+	}
+	store, err := openStore(stateDir, int64(uid), clock)
+	if err != nil {
+		unlockClose(lockFile)
+		return nil, err
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {

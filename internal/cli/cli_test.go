@@ -178,17 +178,26 @@ func TestAcquisitionRefusalsKeepTheirState(t *testing.T) {
 		t.Fatalf("resource add = (%d, %#v), want success", code, got)
 	}
 
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "Bad Tag", "--duration", "10s", "--no-wait", "--request-id", "bad-tag", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_tag" || got.RequestID != "" || len(got.Data) != 0 {
-		t.Fatalf("malformed tag = (%d, %#v), want invalid_tag", code, got)
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "Bad Tag", "--duration", "10s", "--no-wait", "--request-id", "bad-tag", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_tag" || got.RequestID != "bad-tag" || len(got.Data) != 0 {
+		t.Fatalf("malformed tag = (%d, %#v), want invalid_tag with the supplied valid key", code, got)
 	}
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "0s", "--no-wait", "--request-id", "bad-duration", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_duration" || got.RequestID != "" || len(got.Data) != 0 {
-		t.Fatalf("nonpositive duration = (%d, %#v), want invalid_duration", code, got)
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "0s", "--no-wait", "--request-id", "bad-duration", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_duration" || got.RequestID != "bad-duration" || len(got.Data) != 0 {
+		t.Fatalf("nonpositive duration = (%d, %#v), want invalid_duration with the supplied valid key", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "Bad Tag", "--duration", "10s", "--no-wait", "--request-id", "bad id", "--json"); code != 2 || got.Code != "invalid_tag" || got.RequestID != "" || len(got.Data) != 0 {
+		t.Fatalf("malformed tag with invalid key = (%d, %#v), want earlier invalid_tag and no reflected key", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "10s", "--request-id", "bad-wait-mode", "--json"); code != 2 || got.Code != "invalid_wait_mode" || got.RequestID != "bad-wait-mode" || len(got.Data) != 0 {
+		t.Fatalf("missing wait mode = (%d, %#v), want invalid_wait_mode with the supplied valid key", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "10s", "--wait", "--wait-timeout", "bad", "--request-id", "bad-timeout", "--json"); code != 2 || got.Code != "invalid_wait_timeout" || got.RequestID != "bad-timeout" || len(got.Data) != 0 {
+		t.Fatalf("invalid wait timeout = (%d, %#v), want invalid_wait_timeout with the supplied valid key", code, got)
 	}
 	durationCode, durationRefusal := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "21m", "--no-wait", "--request-id", "long-duration", "--json")
 	assertStoredRequestRefusal(t, socket, durationCode, durationRefusal, 5, "duration_exceeds_max", "long-duration")
 	unknownTagCode, unknownTagRefusal := runJSON(t, socket, "lease", "request", "--tag", "qa.missing", "--duration", "10s", "--no-wait", "--request-id", "unknown-tag", "--json")
 	assertStoredRequestRefusal(t, socket, unknownTagCode, unknownTagRefusal, 3, "unknown_tag", "unknown-tag")
-	for _, requestID := range []string{"bad-tag", "bad-duration"} {
+	for _, requestID := range []string{"bad-tag", "bad-duration", "bad-wait-mode", "bad-timeout"} {
 		if code, got := runJSON(t, socket, "lease", "status", "--request-id", requestID, "--json"); code != 3 || got.State != "error" || got.Code != "unknown_request" || got.RequestID != requestID || len(got.Data) != 0 {
 			t.Fatalf("status for malformed request %s = (%d, %#v), want no persisted request", requestID, code, got)
 		}
@@ -257,6 +266,36 @@ func TestRequestIDConflictDoesNotReplaceTheGrant(t *testing.T) {
 	afterCounts := status.Data["counts"].(map[string]any)
 	if beforeCounts["audit_rows"] != afterCounts["audit_rows"] {
 		t.Fatalf("conflict changed audit count from %v to %v", beforeCounts["audit_rows"], afterCounts["audit_rows"])
+	}
+}
+
+// TestStatusTransportErrorsPreserveKnownRequestKeys proves the actual CLI retains a valid nested request-status key on daemon transport failure, suppresses invalid or lease-only keys, and still returns a successful live lookup.
+func TestStatusTransportErrorsPreserveKnownRequestKeys(t *testing.T) {
+	_, socket := startFixture(t)
+	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.status", "--id", "status-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
+		t.Fatalf("status fixture resource = (%d, %#v), want added", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.status", "--duration", "10s", "--no-wait", "--request-id", "known-key", "--json"); code != 0 || got.State != "granted" {
+		t.Fatalf("status fixture lease = (%d, %#v), want granted", code, got)
+	}
+
+	missingDir, err := os.MkdirTemp("", "sl-")
+	if err != nil {
+		t.Fatalf("create short missing-socket directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(missingDir) })
+	missing := filepath.Join(missingDir, "missing.sock")
+	if code, got := runJSON(t, missing, "lease", "status", "--request-id", "known-key", "--json"); code != 69 || got.Code != "daemon_unavailable" || got.RequestID != "known-key" || len(got.Data) != 0 {
+		t.Fatalf("known request-key transport failure = (%d, %#v), want daemon_unavailable with known-key", code, got)
+	}
+	if code, got := runJSON(t, missing, "lease", "status", "--request-id", "bad key", "--json"); code != 2 || got.Code != "invalid_request_id" || got.RequestID != "" || len(got.Data) != 0 {
+		t.Fatalf("invalid request-key status = (%d, %#v), want local rejection without reflected key", code, got)
+	}
+	if code, got := runJSON(t, missing, "lease", "status", "--id", "00000000000000000000000000000001", "--json"); code != 69 || got.Code != "daemon_unavailable" || got.RequestID != "" || len(got.Data) != 0 {
+		t.Fatalf("lease-key transport failure = (%d, %#v), want no request key", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "status", "--request-id", "known-key", "--json"); code != 0 || got.State != "leased" || got.RequestID != "known-key" {
+		t.Fatalf("live request-key status = (%d, %#v), want the same key and leased state", code, got)
 	}
 }
 

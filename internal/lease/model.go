@@ -107,6 +107,9 @@ type fault struct {
 }
 
 func response(op, requestID, state, code string, data map[string]any) Response {
+	if data == nil {
+		data = emptyData()
+	}
 	return Response{Version: 1, Type: "response", Op: op, RequestID: requestID, State: state, Code: code, Data: data}
 }
 
