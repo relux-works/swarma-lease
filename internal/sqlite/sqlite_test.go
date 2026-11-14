@@ -11,6 +11,13 @@ import (
 // TestOpenReadOnlyAllowsInspectionAndRejectsWrites proves a read-only connection can inspect committed WAL-backed data without changing the database or WAL, rejects SQL writes, and does not create a missing database; it does not exercise crash recovery of a WAL.
 func TestOpenReadOnlyAllowsInspectionAndRejectsWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.sqlite")
+	fixture, err := os.OpenFile(dbPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatalf("create writer fixture file: %v", err)
+	}
+	if err := fixture.Close(); err != nil {
+		t.Fatalf("close writer fixture file: %v", err)
+	}
 	writer, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("open writer fixture: %v", err)
