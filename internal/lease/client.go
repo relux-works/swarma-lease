@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -71,8 +72,9 @@ func ExchangeContext(ctx context.Context, socketPath string, request WireRequest
 	}
 	var result Response
 	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&result); err != nil || result.Version != 1 || result.Type != "response" || result.Op != request.Op || result.Data == nil {
+	if err := decoder.Decode(&result); err != nil || result.Version != 1 || result.Type != "response" || result.Op != request.Op || result.Data == nil || !validWireIntegers(result.Data) {
 		return response(request.Op, request.RequestID, "error", "result_unknown", emptyData()), "result_unknown"
 	}
 	if request.RequestID != "" && result.RequestID != request.RequestID {
@@ -90,8 +92,9 @@ func ExchangeContext(ctx context.Context, socketPath string, request WireRequest
 	}
 	var event TerminalEvent
 	eventDecoder := json.NewDecoder(bytes.NewReader(line))
+	eventDecoder.UseNumber()
 	eventDecoder.DisallowUnknownFields()
-	if err := eventDecoder.Decode(&event); err != nil || event.Version != 1 || event.Type != "event" || event.RequestID != request.RequestID || event.Sequence <= 0 || event.Data == nil {
+	if err := eventDecoder.Decode(&event); err != nil || event.Version != 1 || event.Type != "event" || event.RequestID != request.RequestID || event.Sequence <= 0 || event.Data == nil || !validWireIntegers(event.Data) {
 		return response(request.Op, request.RequestID, "error", "result_unknown", emptyData()), "result_unknown"
 	}
 	requestRecord, ok := event.Data["request"].(map[string]any)
@@ -130,6 +133,27 @@ func ExchangeContext(ctx context.Context, socketPath string, request WireRequest
 	default:
 		return response(request.Op, request.RequestID, "error", "result_unknown", emptyData()), "result_unknown"
 	}
+}
+
+func validWireIntegers(value any) bool {
+	switch value := value.(type) {
+	case json.Number:
+		_, err := strconv.ParseInt(value.String(), 10, 64)
+		return err == nil
+	case map[string]any:
+		for _, child := range value {
+			if !validWireIntegers(child) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if !validWireIntegers(child) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func interrupted(request WireRequest, written int) Response {

@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/relux-works/swarma-lease/internal/lease"
 )
@@ -323,5 +327,159 @@ func TestWaitAndCancelCLICommandsCarryOnlyTheRequestKey(t *testing.T) {
 	}
 	if got := exitStatus("client_interrupted"); got != 130 {
 		t.Fatalf("client_interrupted exit = %d, want 130", got)
+	}
+}
+
+// TestHistoryCLIFormsReadTheExpectedAuditWindow proves the documented default, limit, and cursor forms reach the service and return the requested audit entries.
+func TestHistoryCLIFormsReadTheExpectedAuditWindow(t *testing.T) {
+	_, socket := startFixture(t)
+	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.history", "--id", "history-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
+		t.Fatalf("resource-add control = (%d,%#v)", code, got)
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.history", "--duration", "10s", "--no-wait", "--request-id", "history-lease", "--json"); code != 0 || got.State != "granted" {
+		t.Fatalf("lease control = (%d,%#v)", code, got)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"default", []string{"history", "--json"}, 4},
+		{"limit", []string{"history", "--limit", "1", "--json"}, 1},
+		{"cursor", []string{"history", "--limit", "1", "--before-sequence", "2", "--json"}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, got := runJSON(t, socket, tc.args...)
+			entries, ok := got.Data["entries"].([]any)
+			if code != 0 || got.State != "ok" || !ok || len(entries) != tc.want {
+				t.Fatalf("history %v = (%d,%#v), want %d entries", tc.args, code, got, tc.want)
+			}
+			if tc.name == "limit" && entries[0].(map[string]any)["sequence"] != float64(4) {
+				t.Fatalf("limited history = %#v, want newest sequence four", entries)
+			}
+			if tc.name == "cursor" && entries[0].(map[string]any)["sequence"] != float64(1) {
+				t.Fatalf("cursor history = %#v, want sequence below two", entries)
+			}
+		})
+	}
+}
+
+// TestAutoKeyedCLIInterruptionReturnsItsDurableKey proves the real CLI builds an auto-keyed wait request before transport and reports the generated key with unknown attempt state after the peer has acknowledged queueing.
+func TestAutoKeyedCLIInterruptionReturnsItsDurableKey(t *testing.T) {
+	root, err := os.MkdirTemp("", "sl-cli-interrupt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	path := filepath.Join(root, "interrupt.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requestCh := make(chan lease.WireRequest, 1)
+	queuedSent := make(chan struct{})
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		var request lease.WireRequest
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			peerDone <- err
+			return
+		}
+		requestCh <- request
+		queued, err := json.Marshal(lease.Response{Version: 1, Type: "response", Op: request.Op, RequestID: request.RequestID, State: "queued", Data: map[string]any{"request": map[string]any{"request_id": request.RequestID}, "lease": nil, "resource": nil}})
+		if err == nil {
+			_, err = conn.Write(append(queued, '\n'))
+		}
+		close(queuedSent)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+			peerDone <- os.ErrInvalid
+			return
+		}
+		peerDone <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	finished := make(chan int, 1)
+	go func() {
+		finished <- runAtSocketContext(ctx, []string{"lease", "request", "--tag", "qa.pool", "--duration", "10s", "--wait", "--wait-timeout", "30s", "--json"}, &stdout, &stderr, path)
+	}()
+	<-queuedSent
+	request := <-requestCh
+	cancel()
+	select {
+	case code := <-finished:
+		var got result
+		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+			t.Fatalf("decode interrupted CLI result %q: %v", stdout.String(), err)
+		}
+		if code != 130 || got.Code != "client_interrupted" || got.RequestID == "" || got.RequestID != request.RequestID || len(got.RequestID) != 32 || strings.Trim(got.RequestID, "0123456789abcdef") != "" || got.Data["attempt_state"] != "unknown" || strings.Contains(stdout.String()+stderr.String(), "qa.pool") || strings.Contains(stdout.String()+stderr.String(), "30s") {
+			t.Fatalf("interrupted auto-key CLI = (%d,%#v,stderr=%q), want generated key and unknown attempt", code, got, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CLI did not return after cancellation")
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("client sent another frame after queued interruption: %v", err)
+	}
+}
+
+// TestRejectedCLIInputDoesNotEchoPrivateValue proves a malformed private-looking argument is refused locally and absent from stdout and stderr.
+func TestRejectedCLIInputDoesNotEchoPrivateValue(t *testing.T) {
+	const marker = "private/rejected/value"
+	var stdout, stderr bytes.Buffer
+	exit := RunAtSocket([]string{"lease", "request", "--tag", marker, "--duration", "10s", "--no-wait", "--json"}, &stdout, &stderr, filepath.Join(t.TempDir(), "absent.sock"))
+	var got result
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if exit != 2 || got.Code != "invalid_tag" || strings.Contains(stdout.String()+stderr.String(), marker) || stderr.Len() != 0 {
+		t.Fatalf("private-looking CLI refusal = exit %d stdout %q stderr %q", exit, stdout.String(), stderr.String())
+	}
+}
+
+// TestStableRefusalExitCodeTable proves every documented service and CLI refusal code maps to its specified process exit status.
+func TestStableRefusalExitCodeTable(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{"invalid_json", 2}, {"frame_too_large", 2}, {"unsupported_version", 2}, {"unknown_operation", 2}, {"invalid_request", 2},
+		{"invalid_tag", 2}, {"invalid_resource_id", 2}, {"invalid_lease_id", 2}, {"invalid_request_id", 2}, {"invalid_duration", 2},
+		{"invalid_wait_mode", 2}, {"invalid_wait_timeout", 2}, {"invalid_pool_mode", 2},
+		{"unknown_tag", 3}, {"unknown_resource", 3}, {"unknown_lease", 3}, {"unknown_request", 3},
+		{"request_timed_out", 4}, {"request_cancelled", 4}, {"lease_released", 4}, {"lease_expired", 4},
+		{"duration_exceeds_max", 5}, {"wait_exceeds_max", 5}, {"adapter_required", 5}, {"pool_disabled", 5},
+		{"queue_sequence_exhausted", 5}, {"request_id_conflict", 5}, {"duplicate_resource_id", 5}, {"pool_mode_mismatch", 5},
+		{"invalid_transition", 5}, {"request_not_cancellable", 5}, {"no_wait_busy", 75}, {"client_interrupted", 130},
+		{"daemon_unavailable", 69}, {"clock_unavailable", 69}, {"result_unknown", 69}, {"storage_unavailable", 69},
+		{"state_corrupt", 69}, {"state_incompatible", 69}, {"permissions_invalid", 69}, {"unsafe_state_path", 69},
+		{"socket_path_too_long", 69}, {"instance_running", 69}, {"socket_stale_uncertain", 69},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if got := exitStatus(tc.code); got != tc.want {
+				t.Fatalf("exit status for %s = %d, want %d", tc.code, got, tc.want)
+			}
+		})
 	}
 }

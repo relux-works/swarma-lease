@@ -19,16 +19,22 @@ var (
 	errCorrupt           = errors.New("state_corrupt")
 	errIncompatible      = errors.New("state_incompatible")
 	errStorage           = errors.New("storage_unavailable")
+	errClockUnavailable  = errors.New("clock_unavailable")
 )
 
 type Store struct {
 	db       *sqlite.DB
 	ownerUID int64
+	clock    Clock
 	notifier *changeNotifier
+
+	// beforeClockTransactionForTest is a barrier for deterministic transaction-order tests.
+	beforeClockTransactionForTest func()
 }
 
-func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
+func openStore(stateDir string, ownerUID int64, clock Clock) (*Store, error) {
 	dbPath := filepath.Join(stateDir, "leases.sqlite")
+	createdDatabase := false
 	info, err := os.Lstat(dbPath)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := rejectFinalSidecars(stateDir); err != nil {
@@ -37,9 +43,10 @@ func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
 		if err := cleanupBootstrapFiles(stateDir, uint32(ownerUID)); err != nil {
 			return nil, err
 		}
-		if err := bootstrapDatabase(stateDir, dbPath, ownerUID, sample); err != nil {
+		if err := bootstrapDatabase(stateDir, dbPath, ownerUID, clock); err != nil {
 			return nil, err
 		}
+		createdDatabase = true
 	} else if err != nil {
 		return nil, errUnsafePath
 	} else if err := checkOwnedFile(dbPath, info, uint32(ownerUID), 0600); err != nil {
@@ -53,18 +60,28 @@ func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
 	if err != nil {
 		return nil, errStorage
 	}
-	if err := db.ExecScript("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"); err != nil {
+	if err := db.ExecScript("PRAGMA foreign_keys=ON;"); err != nil {
 		_ = db.Close()
 		return nil, errStorage
 	}
-	store := &Store{db: db, ownerUID: ownerUID, notifier: newChangeNotifier()}
+	store := &Store{db: db, ownerUID: ownerUID, clock: clock, notifier: newChangeNotifier()}
 	if err := validateDatabase(db, ownerUID); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := store.recoverBoot(sample); err != nil {
+	if !createdDatabase {
+		if err := store.recoverBoot(); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
+	if err := db.ExecScript("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"); err != nil {
 		_ = db.Close()
 		return nil, errStorage
+	}
+	if err := validateDatabase(db, ownerUID); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	if err := checkSQLiteSidecars(stateDir, uint32(ownerUID)); err != nil {
 		_ = db.Close()
@@ -75,7 +92,7 @@ func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, sample Sample) error {
+func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, clock Clock) error {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return errStorage
@@ -90,17 +107,23 @@ func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, sample Sample
 	}
 	db, err := sqlite.Open(tempPath)
 	if err != nil {
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	if err := db.ExecScript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;"); err != nil {
 		_ = db.Close()
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	err = db.Transaction(func(tx *sqlite.Tx) error {
+		sample, err := readClockSample(clock)
+		if err != nil {
+			return err
+		}
 		if err := tx.ExecScript(schemaSQL); err != nil {
 			return err
 		}
-		_, err := tx.Exec("INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,1,?,?,?,?,?)", ownerUID, maxLeaseNS, maxWaitNS, sample.BootSessionID, timestamp(sample.Wall))
+		_, err = tx.Exec("INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,1,?,?,?,?,?)", ownerUID, maxLeaseNS, maxWaitNS, sample.BootSessionID, timestamp(sample.Wall))
 		if err != nil {
 			return err
 		}
@@ -116,20 +139,30 @@ func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, sample Sample
 	})
 	closeErr := db.Close()
 	if err != nil || closeErr != nil {
+		if cleanupErr := cleanupBootstrapFiles(stateDir, uint32(ownerUID)); cleanupErr != nil {
+			return cleanupErr
+		}
+		if errors.Is(err, errClockUnavailable) && closeErr == nil {
+			return errClockUnavailable
+		}
 		return errStorage
 	}
 	file, err = os.OpenFile(tempPath, os.O_RDWR, 0)
 	if err != nil {
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	if err := file.Close(); err != nil {
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	if err := os.Rename(tempPath, finalPath); err != nil {
+		_ = cleanupBootstrapFiles(stateDir, uint32(ownerUID))
 		return errStorage
 	}
 	return syncDirectory(stateDir)
@@ -186,12 +219,43 @@ func validateDatabase(db *sqlite.DB, ownerUID int64) error {
 	if err != nil || len(settings) != 1 {
 		return errIncompatible
 	}
-	if rowInt(settings[0], "schema_version") != 1 || rowInt(settings[0], "owner_uid") != ownerUID || rowInt(settings[0], "max_lease_ns") != maxLeaseNS || rowInt(settings[0], "max_wait_ns") != maxWaitNS || !validUUID(rowString(settings[0], "boot_session_id")) {
+	if rowInt(settings[0], "schema_version") != 1 || rowInt(settings[0], "owner_uid") != ownerUID || rowInt(settings[0], "max_lease_ns") != maxLeaseNS || rowInt(settings[0], "max_wait_ns") != maxWaitNS {
 		return errUnsafePath
+	}
+	bootSessionID := rowString(settings[0], "boot_session_id")
+	if !validUUID(bootSessionID) {
+		return errCorrupt
+	}
+	if err := validateLiveEpochs(db, bootSessionID); err != nil {
+		return err
 	}
 	fks, err := db.Query("PRAGMA foreign_key_check")
 	if err != nil || len(fks) != 0 {
 		return errCorrupt
+	}
+	return nil
+}
+
+func validateLiveEpochs(db *sqlite.DB, settingsBootID string) error {
+	leases, err := db.Query("SELECT boot_session_id FROM leases WHERE state='active'")
+	if err != nil {
+		return errCorrupt
+	}
+	for _, row := range leases {
+		bootID := rowString(row, "boot_session_id")
+		if !validUUID(bootID) || bootID != settingsBootID {
+			return errCorrupt
+		}
+	}
+	requests, err := db.Query("SELECT queue_boot_session_id FROM requests WHERE state='queued'")
+	if err != nil {
+		return errCorrupt
+	}
+	for _, row := range requests {
+		bootID := rowString(row, "queue_boot_session_id")
+		if !validUUID(bootID) || bootID != settingsBootID {
+			return errCorrupt
+		}
 	}
 	return nil
 }

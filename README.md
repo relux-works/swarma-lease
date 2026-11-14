@@ -4,7 +4,7 @@ Swarma Lease is a local service for registering shared resources and leasing one
 
 ## Status
 
-The v1 design is documented in the [MVP contract](docs/contract.md). The Go module, CLI, and local service are under implementation; the current candidate still needs its required Mac build and test run before it can be treated as verified. The first implementation slice covers manual-pool leasing; command execution follows in a later slice.
+The first implementation slice includes manual-pool leasing, FIFO wait, lease hard ends, same-boot and reboot recovery, the local-socket protocol, and status/history commands. The first-slice acceptance suite and macOS race/build verification pass. Command execution follows in a later slice.
 
 ## Tools and commands
 
@@ -17,7 +17,7 @@ Contributor entry points:
 | Swarma Lease CLI | Start the service and manage resources and leases | `.temp/bin/swarma-lease serve`<br>`.temp/bin/swarma-lease resource add --tag qa.pool --id qa-01 --mode manual --json`<br>`.temp/bin/swarma-lease lease request --tag qa.pool --duration 20m --no-wait --json`<br>`.temp/bin/swarma-lease lease request --tag qa.pool --duration 20m --wait --wait-timeout 30m --request-id req-01 --json`<br>`.temp/bin/swarma-lease lease wait --request-id req-01 --json`<br>`.temp/bin/swarma-lease lease cancel --request-id req-01 --json`<br>`.temp/bin/swarma-lease lease release --id <lease-id> --json` | Management commands return one JSON object on stdout. Blocking commands print only the final result. Service state is stored under `~/.swarma-lease/`. |
 | SQLite database | Persist single-host lease state | Managed by the Go service; no standalone command is required. | `~/.swarma-lease/leases.sqlite`, its WAL files, `service.lock`, and `service.sock`. SQLite is the only source of truth. |
 
-Build artifacts are kept under the ignored `.temp/` directory; runtime state stays under the effective user's system-account home. The service checks every state-directory and custom socket-parent component without following symlinks. On macOS, custom paths rooted under system symlinks such as `/tmp` or `/var` are refused; the default account-home path is resolved from the system account record. Socket paths that exceed the platform Unix-domain address capacity are refused before state creation with `socket_path_too_long`. Blocking FIFO requests, wait, and cancellation are implemented; hard-end/restart recovery and the full first-slice acceptance run remain pending.
+Build artifacts are kept under the ignored `.temp/` directory; runtime state stays under the effective user's system-account home. The service checks every state-directory and custom socket-parent component without following symlinks. On macOS, custom paths rooted under system symlinks such as `/tmp` or `/var` are refused; the default account-home path is resolved from the system account record. Socket paths that exceed the platform Unix-domain address capacity are refused before state creation with `socket_path_too_long`. The command adapter remains out of scope for this slice.
 
 ## License
 

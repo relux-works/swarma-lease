@@ -18,9 +18,22 @@ type AcquireInput struct {
 	WaitTimeoutNS *int64
 }
 
-func (s *Store) recoverBoot(sample Sample) error {
+func (s *Store) withClockTransaction(fn func(*sqlite.Tx, Sample) error) error {
+	if s.beforeClockTransactionForTest != nil {
+		s.beforeClockTransactionForTest()
+	}
+	return s.db.Transaction(func(tx *sqlite.Tx) error {
+		sample, err := readClockSample(s.clock)
+		if err != nil {
+			return err
+		}
+		return fn(tx, sample)
+	})
+}
+
+func (s *Store) recoverBoot() error {
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		rows, err := tx.Query("SELECT boot_session_id FROM settings WHERE singleton_id=1")
 		if err != nil || len(rows) != 1 {
 			return sqlite.ErrStorage
@@ -45,7 +58,7 @@ func (s *Store) recoverBoot(sample Sample) error {
 	return err
 }
 
-func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any, string) {
+func (s *Store) Acquire(in AcquireInput) (string, map[string]any, string) {
 	if in.DurationNS <= 0 {
 		return "error", emptyData(), "invalid_duration"
 	}
@@ -58,7 +71,7 @@ func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any,
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
@@ -169,11 +182,11 @@ func (s *Store) refuse(tx *sqlite.Tx, in AcquireInput, sample Sample, refusal st
 	return nil
 }
 
-func (s *Store) AddResource(tag, id, mode string, sample Sample) (string, map[string]any, string) {
+func (s *Store) AddResource(tag, id, mode string) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
@@ -228,11 +241,11 @@ func (s *Store) AddResource(tag, id, mode string, sample Sample) (string, map[st
 	return state, data, code
 }
 
-func (s *Store) SetResource(operation, id string, confirmStopped bool, sample Sample) (string, map[string]any, string) {
+func (s *Store) SetResource(operation, id string, confirmStopped bool) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
@@ -308,11 +321,11 @@ func (s *Store) SetResource(operation, id string, confirmStopped bool, sample Sa
 	return state, data, code
 }
 
-func (s *Store) Release(leaseID string, sample Sample) (string, map[string]any, string) {
+func (s *Store) Release(leaseID string) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
@@ -506,6 +519,9 @@ func (s *Store) applyDue(tx *sqlite.Tx, sample Sample, operation string, events 
 }
 
 func storageCode(err error) string {
+	if errors.Is(err, errClockUnavailable) {
+		return "clock_unavailable"
+	}
 	if errors.Is(err, sqlite.ErrOutcomeUnknown) {
 		return "result_unknown"
 	}

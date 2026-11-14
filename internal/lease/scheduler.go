@@ -74,10 +74,10 @@ func disableAllExhaustedResources(tx *sqlite.Tx, sample Sample) error {
 	return nil
 }
 
-func (s *Store) RunScheduler(sample Sample) (bool, string) {
+func (s *Store) RunScheduler() (bool, string) {
 	var events []TerminalEvent
 	var changed bool
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		before, err := auditSequence(tx)
 		if err != nil {
 			return err
@@ -102,11 +102,11 @@ func (s *Store) RunScheduler(sample Sample) (bool, string) {
 	return changed, ""
 }
 
-func (s *Store) Wait(requestID string, sample Sample) (string, map[string]any, string) {
+func (s *Store) Wait(requestID string) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
@@ -143,11 +143,11 @@ func (s *Store) Wait(requestID string, sample Sample) (string, map[string]any, s
 	return state, data, code
 }
 
-func (s *Store) Cancel(requestID string, sample Sample) (string, map[string]any, string) {
+func (s *Store) Cancel(requestID string) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
 	var events []TerminalEvent
-	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
 		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}

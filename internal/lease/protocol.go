@@ -108,51 +108,53 @@ func (s *Server) handleJSON(raw []byte) (Response, bool) {
 	if err := json.Unmarshal(raw, &top); err != nil || top == nil {
 		return response("protocol", "", "error", "invalid_json", emptyData()), true
 	}
-	var opName string
-	if len(top["op"]) == 0 || json.Unmarshal(top["op"], &opName) != nil {
-		return response("protocol", "", "error", "invalid_request", emptyData()), false
+	responseOp := "protocol"
+	opName, hasOperationString := jsonStringValue(top["op"])
+	if hasOperationString && knownOperation(opName) {
+		responseOp = opName
 	}
-	known := knownOperation(opName)
-	responseOp := opName
-	if !known {
-		responseOp = "protocol"
-	}
-	requestID := ""
-	if len(top["version"]) == 0 || len(top["type"]) == 0 || len(top["data"]) == 0 {
+	var version int64
+	if !parseIntField(top["version"], &version) {
 		return response(responseOp, "", "error", "invalid_request", emptyData()), false
 	}
+	if version != 1 {
+		return response(responseOp, "", "error", "unsupported_version", emptyData()), false
+	}
+	if len(top["op"]) == 0 || !hasOperationString {
+		return response("protocol", "", "error", "invalid_request", emptyData()), false
+	}
+	if !knownOperation(opName) {
+		return response("protocol", "", "error", "unknown_operation", emptyData()), false
+	}
+	requestID := ""
+	responseID := ""
 	if isKeyOperation(opName) {
 		if len(top["request_id"]) == 0 {
 			return response(opName, "", "error", "invalid_request", emptyData()), false
 		}
-		if json.Unmarshal(top["request_id"], &requestID) != nil || !requestIDPattern.MatchString(requestID) {
-			return response(opName, "", "error", "invalid_request_id", emptyData()), false
+		var validType bool
+		requestID, validType = jsonStringValue(top["request_id"])
+		if !validType {
+			return response(opName, "", "error", "invalid_request", emptyData()), false
+		}
+		if requestIDPattern.MatchString(requestID) {
+			responseID = requestID
 		}
 	} else if len(top["request_id"]) != 0 {
 		return response(opName, "", "error", "invalid_request", emptyData()), false
 	}
-	if !known {
-		return response("protocol", "", "error", "unknown_operation", emptyData()), false
-	}
 	allowedTopLevelKeys := []string{"version", "type", "op", "data"}
 	allowedTopLevelKeys = append(allowedTopLevelKeys, optionalRequestKey(opName)...)
-	if !onlyKeys(top, allowedTopLevelKeys...) {
-		return response(opName, requestID, "error", "invalid_request", emptyData()), false
-	}
-	var version int64
-	if err := strictInt(top["version"], &version); err != nil {
-		return response(opName, requestID, "error", "invalid_request", emptyData()), false
+	if !onlyKeys(top, allowedTopLevelKeys...) || len(top["type"]) == 0 || len(top["data"]) == 0 {
+		return response(opName, responseID, "error", "invalid_request", emptyData()), false
 	}
 	var messageType string
-	if json.Unmarshal(top["type"], &messageType) != nil || messageType != "request" {
-		return response(opName, requestID, "error", "invalid_request", emptyData()), false
-	}
-	if version != 1 {
-		return response(opName, requestID, "error", "unsupported_version", emptyData()), false
+	if messageType, _ = jsonStringValue(top["type"]); messageType != "request" {
+		return response(opName, responseID, "error", "invalid_request", emptyData()), false
 	}
 	var rawData map[string]json.RawMessage
 	if err := json.Unmarshal(top["data"], &rawData); err != nil || rawData == nil {
-		return response(opName, requestID, "error", "invalid_request", emptyData()), false
+		return response(opName, responseID, "error", "invalid_request", emptyData()), false
 	}
 
 	state, data, code, responseID, malformed := s.dispatch(opName, requestID, rawData)
@@ -163,7 +165,10 @@ func (s *Server) handleJSON(raw []byte) (Response, bool) {
 }
 
 func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage) (string, map[string]any, string, string, bool) {
-	responseID := requestID
+	responseID := ""
+	if isKeyOperation(op) && requestIDPattern.MatchString(requestID) {
+		responseID = requestID
+	}
 	invalid := func(code string, includeID bool) (string, map[string]any, string, string, bool) {
 		if !includeID {
 			responseID = ""
@@ -171,8 +176,11 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		return "error", emptyData(), code, responseID, false
 	}
 	if op == "lease.status" && len(data) == 1 && onlyKeys(data, "request_id") {
-		var lookupID string
-		if json.Unmarshal(data["request_id"], &lookupID) != nil || !requestIDPattern.MatchString(lookupID) {
+		lookupID, validType := jsonStringValue(data["request_id"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		if !requestIDPattern.MatchString(lookupID) {
 			return invalid("invalid_request_id", false)
 		}
 		responseID = lookupID
@@ -180,8 +188,11 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		return state, result, code, responseID, false
 	}
 	if op == "lease.status" && len(data) == 1 && onlyKeys(data, "lease_id") {
-		var lookupID string
-		if json.Unmarshal(data["lease_id"], &lookupID) != nil || !leaseIDPattern.MatchString(lookupID) {
+		lookupID, validType := jsonStringValue(data["lease_id"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		if !leaseIDPattern.MatchString(lookupID) {
 			return invalid("invalid_lease_id", false)
 		}
 		state, result, code := s.store.Status("", lookupID)
@@ -193,53 +204,77 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 			return invalid("invalid_request", true)
 		}
 		var input AcquireInput
-		if json.Unmarshal(data["tag"], &input.Tag) != nil || !tagIDPattern.MatchString(input.Tag) {
+		var validType bool
+		input.Tag, validType = jsonStringValue(data["tag"])
+		if !validType {
+			return invalid("invalid_request", true)
+		}
+		if !parseIntField(data["duration_ns"], &input.DurationNS) {
+			return invalid("invalid_request", true)
+		}
+		input.WaitMode, validType = jsonStringValue(data["wait_mode"])
+		if !validType {
+			return invalid("invalid_request", true)
+		}
+		var waitTimeout int64
+		waitTimeoutPresent := len(data["wait_timeout_ns"]) != 0
+		if waitTimeoutPresent && !parseIntField(data["wait_timeout_ns"], &waitTimeout) {
+			return invalid("invalid_request", true)
+		}
+		if !requestIDPattern.MatchString(requestID) {
+			return invalid("invalid_request_id", false)
+		}
+		if !tagIDPattern.MatchString(input.Tag) {
 			return invalid("invalid_tag", true)
 		}
-		if strictInt(data["duration_ns"], &input.DurationNS) != nil || input.DurationNS <= 0 {
+		if input.DurationNS <= 0 {
 			return invalid("invalid_duration", true)
 		}
-		if json.Unmarshal(data["wait_mode"], &input.WaitMode) != nil || (input.WaitMode != "wait" && input.WaitMode != "no_wait") {
+		if input.WaitMode != "wait" && input.WaitMode != "no_wait" {
 			return invalid("invalid_wait_mode", true)
 		}
 		if input.WaitMode == "wait" {
-			if len(data["wait_timeout_ns"]) == 0 || strictInt(data["wait_timeout_ns"], new(int64)) != nil {
+			if !waitTimeoutPresent {
 				return invalid("invalid_wait_timeout", true)
 			}
-			var wait int64
-			if strictInt(data["wait_timeout_ns"], &wait) != nil || wait <= 0 {
+			if waitTimeout <= 0 {
 				return invalid("invalid_wait_timeout", true)
 			}
-			input.WaitTimeoutNS = &wait
-		} else if len(data["wait_timeout_ns"]) != 0 {
+			input.WaitTimeoutNS = &waitTimeout
+		} else if waitTimeoutPresent {
 			return invalid("invalid_wait_timeout", true)
 		}
 		input.RequestID = requestID
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", true)
-		}
-		state, result, code := s.store.Acquire(input, sample)
+		state, result, code := s.store.Acquire(input)
 		return state, result, code, responseID, false
 	case "resource.add":
 		if !onlyKeys(data, "tag", "resource_id", "mode") || len(data) != 3 {
 			return invalid("invalid_request", false)
 		}
 		var tag, id, mode string
-		if json.Unmarshal(data["tag"], &tag) != nil || !tagIDPattern.MatchString(tag) {
+		var validType bool
+		tag, validType = jsonStringValue(data["tag"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		id, validType = jsonStringValue(data["resource_id"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		mode, validType = jsonStringValue(data["mode"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		if !tagIDPattern.MatchString(tag) {
 			return invalid("invalid_tag", false)
 		}
-		if json.Unmarshal(data["resource_id"], &id) != nil || !tagIDPattern.MatchString(id) {
+		if !tagIDPattern.MatchString(id) {
 			return invalid("invalid_resource_id", false)
 		}
-		if json.Unmarshal(data["mode"], &mode) != nil || (mode != "manual" && mode != "command") {
+		if mode != "manual" && mode != "command" {
 			return invalid("invalid_pool_mode", false)
 		}
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", false)
-		}
-		state, result, code := s.store.AddResource(tag, id, mode, sample)
+		state, result, code := s.store.AddResource(tag, id, mode)
 		return state, result, code, "", false
 	case "resource.disable", "resource.enable":
 		if !onlyKeys(data, "resource_id") || len(data) != 1 {
@@ -249,43 +284,40 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if code != "" {
 			return invalid(code, false)
 		}
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", false)
-		}
-		state, result, code := s.store.SetResource(op, id, false, sample)
+		state, result, code := s.store.SetResource(op, id, false)
 		return state, result, code, "", false
 	case "resource.recover":
 		if !onlyKeys(data, "resource_id", "confirm_stopped") || len(data) != 2 {
 			return invalid("invalid_request", false)
 		}
-		id, code := parseResourceID(data["resource_id"])
-		if code != "" {
-			return invalid(code, false)
-		}
-		var confirm bool
-		if json.Unmarshal(data["confirm_stopped"], &confirm) != nil || !confirm {
+		id, validType := jsonStringValue(data["resource_id"])
+		if !validType {
 			return invalid("invalid_request", false)
 		}
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", false)
+		var confirm bool
+		if !jsonBoolValue(data["confirm_stopped"], &confirm) {
+			return invalid("invalid_request", false)
 		}
-		state, result, code := s.store.SetResource(op, id, true, sample)
+		if !tagIDPattern.MatchString(id) {
+			return invalid("invalid_resource_id", false)
+		}
+		if !confirm {
+			return invalid("invalid_request", false)
+		}
+		state, result, code := s.store.SetResource(op, id, true)
 		return state, result, code, "", false
 	case "lease.release":
 		if !onlyKeys(data, "lease_id") || len(data) != 1 {
 			return invalid("invalid_request", false)
 		}
-		var id string
-		if json.Unmarshal(data["lease_id"], &id) != nil || !leaseIDPattern.MatchString(id) {
+		id, validType := jsonStringValue(data["lease_id"])
+		if !validType {
+			return invalid("invalid_request", false)
+		}
+		if !leaseIDPattern.MatchString(id) {
 			return invalid("invalid_lease_id", false)
 		}
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", false)
-		}
-		state, result, code := s.store.Release(id, sample)
+		state, result, code := s.store.Release(id)
 		return state, result, code, "", false
 	case "service.status":
 		if len(data) != 0 {
@@ -302,13 +334,13 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 			return invalid("invalid_request", false)
 		}
 		var limit int64
-		if strictInt(data["limit"], &limit) != nil || limit < 1 || limit > 100 {
+		if !parseIntField(data["limit"], &limit) || limit < 1 || limit > 100 {
 			return invalid("invalid_request", false)
 		}
 		var before *int64
 		if raw := data["before_sequence"]; len(raw) != 0 {
 			var value int64
-			if strictInt(raw, &value) != nil || value <= 0 {
+			if !parseIntField(raw, &value) || value <= 0 {
 				return invalid("invalid_request", false)
 			}
 			before = &value
@@ -323,15 +355,14 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if len(data) != 0 {
 			return invalid("invalid_request", true)
 		}
-		sample, err := s.clock.Read()
-		if err != nil {
-			return invalid("clock_unavailable", true)
+		if !requestIDPattern.MatchString(requestID) {
+			return invalid("invalid_request_id", false)
 		}
 		if op == "lease.wait" {
-			state, result, code := s.store.Wait(requestID, sample)
+			state, result, code := s.store.Wait(requestID)
 			return state, result, code, responseID, false
 		}
-		state, result, code := s.store.Cancel(requestID, sample)
+		state, result, code := s.store.Cancel(requestID)
 		return state, result, code, responseID, false
 	case "lease.status":
 		return invalid("invalid_request", false)
@@ -404,9 +435,40 @@ func strictInt(raw json.RawMessage, target *int64) error {
 	return nil
 }
 
+func jsonStringValue(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func jsonBoolValue(raw json.RawMessage, target *bool) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if !bytes.Equal(trimmed, []byte("true")) && !bytes.Equal(trimmed, []byte("false")) {
+		return false
+	}
+	return json.Unmarshal(trimmed, target) == nil
+}
+
+func parseIntField(raw json.RawMessage, target *int64) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if !integerPattern.Match(trimmed) {
+		return false
+	}
+	return strictInt(trimmed, target) == nil
+}
+
 func parseResourceID(raw json.RawMessage) (string, string) {
-	var id string
-	if json.Unmarshal(raw, &id) != nil || !tagIDPattern.MatchString(id) {
+	id, validType := jsonStringValue(raw)
+	if !validType {
+		return "", "invalid_request"
+	}
+	if !tagIDPattern.MatchString(id) {
 		return "", "invalid_resource_id"
 	}
 	return id, ""

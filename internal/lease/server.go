@@ -48,9 +48,8 @@ func Start(config Config) (*Server, error) {
 	if clock == nil {
 		clock = systemClock{}
 	}
-	sample, err := clock.Read()
-	if err != nil || !validUUID(sample.BootSessionID) || sample.Wall.IsZero() || sample.MonotonicNS < 0 {
-		return nil, errors.New("clock_unavailable")
+	if _, err := readClockSample(clock); err != nil {
+		return nil, errClockUnavailable
 	}
 	stateDir := config.StateDir
 	if stateDir == "" {
@@ -60,7 +59,7 @@ func Start(config Config) (*Server, error) {
 		}
 		stateDir = filepath.Join(home, ".swarma-lease")
 	}
-	stateDir, err = filepath.Abs(stateDir)
+	stateDir, err := filepath.Abs(stateDir)
 	if err != nil {
 		return nil, errUnsafePath
 	}
@@ -92,7 +91,7 @@ func Start(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := openStore(stateDir, int64(uid), sample)
+	store, err := openStore(stateDir, int64(uid), clock)
 	if err != nil {
 		unlockClose(lockFile)
 		return nil, err
@@ -130,14 +129,24 @@ func Start(config Config) (*Server, error) {
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
+	listener.SetUnlinkOnClose(false)
+	boundInfo, err := os.Lstat(socketPath)
+	if err != nil || boundInfo.Mode()&os.ModeSocket == 0 || boundInfo.Mode()&os.ModeSymlink != 0 {
+		_ = listener.Close()
+		_ = store.Close()
+		unlockClose(lockFile)
+		return nil, errUnsafePath
+	}
 	if err := os.Chmod(socketPath, 0600); err != nil {
+		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
 		unlockClose(lockFile)
 		return nil, errBadMode
 	}
 	socketInfo, err := os.Lstat(socketPath)
-	if err != nil || socketInfo.Mode()&os.ModeSocket == 0 {
+	if err != nil || !os.SameFile(boundInfo, socketInfo) || socketInfo.Mode()&os.ModeSocket == 0 || socketInfo.Mode()&os.ModeSymlink != 0 {
+		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
 		unlockClose(lockFile)
@@ -145,12 +154,14 @@ func Start(config Config) (*Server, error) {
 	}
 	stat, ok := socketInfo.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uint32(uid) {
+		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
 		unlockClose(lockFile)
 		return nil, errUnsafePath
 	}
 	if socketInfo.Mode().Perm() != 0600 {
+		_ = removeOwnedSocket(socketPath, boundInfo, uint32(uid))
 		_ = listener.Close()
 		_ = store.Close()
 		unlockClose(lockFile)
@@ -178,6 +189,27 @@ func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) erro
 	}
 	if err := os.Remove(path); err != nil {
 		return errors.New("socket_stale_uncertain")
+	}
+	return nil
+}
+
+func removeOwnedSocket(path string, expected os.FileInfo, uid uint32) error {
+	if expected == nil {
+		return nil
+	}
+	current, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !os.SameFile(expected, current) || current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	stat, ok := current.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uid {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errUnsafePath
 	}
 	return nil
 }
@@ -458,14 +490,7 @@ func (s *Server) serveWait(conn net.Conn, queued Response) error {
 func (s *Server) runScheduler(ctx context.Context) {
 	for {
 		changed := s.store.changes()
-		sample, err := s.clock.Read()
-		if err != nil {
-			if !s.waitSchedulerRetry(ctx, changed) {
-				return
-			}
-			continue
-		}
-		if _, code := s.store.RunScheduler(sample); code != "" {
+		if _, code := s.store.RunScheduler(); code != "" {
 			if !s.waitSchedulerRetry(ctx, changed) {
 				return
 			}
@@ -484,7 +509,7 @@ func (s *Server) runScheduler(ctx context.Context) {
 		default:
 		}
 
-		sample, err = s.clock.Read()
+		sample, err := readClockSample(s.clock)
 		if err != nil {
 			if !s.waitSchedulerRetry(ctx, changed) {
 				return
@@ -522,10 +547,7 @@ func (s *Server) runScheduler(ctx context.Context) {
 		case <-changed:
 			timer.Stop()
 		case <-timer.C:
-			sample, err := s.clock.Read()
-			if err == nil {
-				_, _ = s.store.RunScheduler(sample)
-			}
+			continue
 		}
 	}
 }
@@ -602,13 +624,8 @@ func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.stopServing()
 		s.workers.Wait()
-		if info, err := os.Lstat(s.socketPath); err == nil && os.SameFile(info, s.socketInfo) && info.Mode()&os.ModeSocket != 0 {
-			stat, ok := info.Sys().(*syscall.Stat_t)
-			if ok && stat.Uid == uint32(s.ownerUID) && info.Mode().Perm() == 0600 {
-				if err := os.Remove(s.socketPath); err != nil {
-					s.closeErr = errors.New("unsafe_state_path")
-				}
-			}
+		if err := removeOwnedSocket(s.socketPath, s.socketInfo, uint32(s.ownerUID)); err != nil {
+			s.closeErr = errors.New("unsafe_state_path")
 		}
 		if s.store != nil {
 			if err := s.store.Close(); err != nil && s.closeErr == nil {

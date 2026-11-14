@@ -286,11 +286,7 @@ func TestRestartRecoversProvenStaleSocketAndPreservesLiveSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start initial service: %v", err)
 	}
-	sample, err := first.clock.Read()
-	if err != nil {
-		t.Fatalf("read test clock: %v", err)
-	}
-	if state, _, code := first.store.AddResource("qa.persist", "persist-01", "manual", sample); code != "" || state != "added" {
+	if state, _, code := first.store.AddResource("qa.persist", "persist-01", "manual"); code != "" || state != "added" {
 		t.Fatalf("persist resource before restart = (%s, %s), want added", state, code)
 	}
 	if err := first.Close(); err != nil {

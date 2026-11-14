@@ -96,6 +96,17 @@ type Clock interface {
 	Read() (Sample, error)
 }
 
+func readClockSample(clock Clock) (Sample, error) {
+	if clock == nil {
+		return Sample{}, errClockUnavailable
+	}
+	sample, err := clock.Read()
+	if err != nil || !validUUID(sample.BootSessionID) || sample.Wall.IsZero() || sample.MonotonicNS < 0 {
+		return Sample{}, errClockUnavailable
+	}
+	return sample, nil
+}
+
 type systemClock struct{}
 
 func (systemClock) Read() (Sample, error) {

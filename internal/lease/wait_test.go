@@ -167,7 +167,20 @@ func requestSequence(t *testing.T, result map[string]any) int64 {
 	switch request := result["request"].(type) {
 	case map[string]any:
 		if request["queue_sequence"] != nil {
-			return int64(request["queue_sequence"].(float64))
+			switch value := request["queue_sequence"].(type) {
+			case json.Number:
+				sequence, err := value.Int64()
+				if err != nil {
+					t.Fatalf("invalid queue sequence %q: %v", value, err)
+				}
+				return sequence
+			case int64:
+				return value
+			case float64:
+				return int64(value)
+			default:
+				t.Fatalf("queue sequence has type %T, want exact integer", value)
+			}
 		}
 	case RequestRecord:
 		if request.QueueSequence != nil {

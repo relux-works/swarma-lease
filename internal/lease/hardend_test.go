@@ -154,7 +154,12 @@ func hardEndAuditGrantSequence(t *testing.T, server *Server, requestID string) i
 
 func runHardEndScheduler(t *testing.T, server *Server, sample Sample) {
 	t.Helper()
-	if _, code := server.store.RunScheduler(sample); code != "" {
+	clock, ok := server.clock.(*controlledLeaseClock)
+	if !ok {
+		t.Fatal("test server clock is not controlled")
+	}
+	clock.set(sample)
+	if _, code := server.store.RunScheduler(); code != "" {
 		t.Fatalf("run scheduler at monotonic %d = %s, want success", sample.MonotonicNS, code)
 	}
 }
@@ -380,7 +385,8 @@ func TestExpiryStorageFailureRollsBackWholeTransition(t *testing.T) {
 		t.Fatalf("install isolated expiry failure trigger: %v", err)
 	}
 	atHardEnd := hardEndSampleAfter(base, 10*time.Second, 0)
-	if _, code := server.store.RunScheduler(atHardEnd); code != "storage_unavailable" {
+	clock.set(atHardEnd)
+	if _, code := server.store.RunScheduler(); code != "storage_unavailable" {
 		t.Fatalf("scheduler with injected expiry failure = %s, want storage_unavailable", code)
 	}
 	state, data := hardEndStatus(t, server, "atomic-holder")
@@ -390,7 +396,7 @@ func TestExpiryStorageFailureRollsBackWholeTransition(t *testing.T) {
 	if err := server.store.db.ExecScript("DROP TRIGGER injected_expiry_resource_update_failure;"); err != nil {
 		t.Fatalf("remove isolated expiry failure trigger: %v", err)
 	}
-	if _, code := server.store.RunScheduler(atHardEnd); code != "" {
+	if _, code := server.store.RunScheduler(); code != "" {
 		t.Fatalf("retry scheduler at hard end = %s, want success", code)
 	}
 	state, data = hardEndStatus(t, server, "atomic-holder")

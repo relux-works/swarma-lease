@@ -45,13 +45,17 @@ func Run(args []string, stdout, stderr io.Writer) int {
 }
 
 func RunAtSocket(args []string, stdout, stderr io.Writer, socket string) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runAtSocketContext(ctx, args, stdout, stderr, socket)
+}
+
+func runAtSocketContext(ctx context.Context, args []string, stdout, stderr io.Writer, socket string) int {
 	_ = stderr
 	request, parseErr := buildRequest(args)
 	if parseErr != nil {
 		return writeCLIError(stdout, parseErr.op, parseErr.requestID, parseErr.code)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	result, _ := lease.ExchangeContext(ctx, socket, request)
 	return writeResponse(stdout, result)
 }
@@ -125,7 +129,11 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	default:
 		return lease.WireRequest{}, &commandError{op: "cli", code: "invalid_request"}
 	}
-	flags, err := parseFlags(args[2:], valueFlags, boolFlags)
+	flagArgs := args[2:]
+	if mode == "history" {
+		flagArgs = args[1:]
+	}
+	flags, err := parseFlags(flagArgs, valueFlags, boolFlags)
 	if err != nil || !flags.bools["--json"] {
 		return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
 	}
