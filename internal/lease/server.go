@@ -127,17 +127,20 @@ func Start(config Config) (*Server, error) {
 			return nil, errUnsafePath
 		}
 	}
+	if staleSocketInfo != nil {
+		if err := preflightStoreBeforeStaleSocketRemoval(stateDir, int64(uid)); err != nil {
+			unlockClose(lockFile)
+			return nil, err
+		}
+		if err := removeProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid)); err != nil {
+			unlockClose(lockFile)
+			return nil, err
+		}
+	}
 	store, err := openStore(stateDir, int64(uid), clock)
 	if err != nil {
 		unlockClose(lockFile)
 		return nil, err
-	}
-	if staleSocketInfo != nil {
-		if err := removeProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid)); err != nil {
-			_ = store.Close()
-			unlockClose(lockFile)
-			return nil, err
-		}
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {

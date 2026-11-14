@@ -317,7 +317,7 @@ func TestInvalidCLIInputsDoNotReserveState(t *testing.T) {
 	}
 }
 
-// TestLocalFlagErrorsKeepOnlyKnownRequestKeys proves the actual CLI preserves a valid unique key on early flag refusals, suppresses invalid or duplicate keys, leaves service state unchanged, and permits a later valid acquisition with the same key.
+// TestLocalFlagErrorsKeepOnlyKnownRequestKeys proves the actual CLI preserves a valid unique key after a self-delimited unknown inline flag, suppresses invalid or ambiguous keys, leaves service state unchanged, and permits a later valid acquisition with the same key.
 func TestLocalFlagErrorsKeepOnlyKnownRequestKeys(t *testing.T) {
 	_, socket := startFixture(t)
 	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.keys", "--id", "keys-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
@@ -341,6 +341,11 @@ func TestLocalFlagErrorsKeepOnlyKnownRequestKeys(t *testing.T) {
 		{name: "wait-missing-json", args: []string{"lease", "wait", "--request-id", requestID}, wantKey: requestID},
 		{name: "cancel-missing-json", args: []string{"lease", "cancel", "--request-id", requestID}, wantKey: requestID},
 		{name: "status-missing-json", args: []string{"lease", "status", "--request-id", requestID}, wantKey: requestID},
+		{name: "acquire-unknown-inline-before-key", args: []string{"lease", "request", "--tag", "qa.keys", "--duration", "10s", "--no-wait", "--unknown=value", "--request-id=" + requestID, "--json"}, wantKey: requestID},
+		{name: "wait-unknown-inline-before-key", args: []string{"lease", "wait", "--unknown=value", "--request-id=" + requestID, "--json"}, wantKey: requestID},
+		{name: "cancel-unknown-inline-before-key", args: []string{"lease", "cancel", "--unknown=value", "--request-id=" + requestID, "--json"}, wantKey: requestID},
+		{name: "status-unknown-inline-before-key", args: []string{"lease", "status", "--unknown=value", "--request-id=" + requestID, "--json"}, wantKey: requestID},
+		{name: "wait-key-before-unknown-inline-control", args: []string{"lease", "wait", "--request-id=" + requestID, "--unknown=value", "--json"}, wantKey: requestID},
 		{name: "wait-before-unknown-flag", args: []string{"lease", "wait", "--request-id", requestID, "--unknown"}, wantKey: requestID},
 		{name: "wait-before-duplicate-json", args: []string{"lease", "wait", "--request-id", requestID, "--json", "--json"}, wantKey: requestID},
 		{name: "wait-after-unknown-flag-suppresses", args: []string{"lease", "wait", "--unknown", "--request-id", requestID}},

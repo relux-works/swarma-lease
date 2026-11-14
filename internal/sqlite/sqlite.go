@@ -48,11 +48,20 @@ type Tx struct {
 }
 
 func Open(path string) (*DB, error) {
+	return open(path, C.SQLITE_OPEN_READWRITE)
+}
+
+// OpenReadOnly opens an existing database without granting SQLite write access.
+func OpenReadOnly(path string) (*DB, error) {
+	return open(path, C.SQLITE_OPEN_READONLY)
+}
+
+func open(path string, accessFlags C.int) (*DB, error) {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 
 	var conn *C.sqlite3
-	flags := C.int(C.SQLITE_OPEN_READWRITE | C.SQLITE_OPEN_FULLMUTEX)
+	flags := accessFlags | C.SQLITE_OPEN_FULLMUTEX
 	if rc := C.sqlite3_open_v2(cpath, &conn, flags, nil); rc != C.SQLITE_OK {
 		if conn != nil {
 			C.sqlite3_close_v2(conn)

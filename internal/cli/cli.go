@@ -273,7 +273,7 @@ func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
 	}
 	result := parsedFlags{values: make(map[string]string), bools: make(map[string]bool), ambiguous: make(map[string]bool)}
 	invalid := false
-	unknownSeen := false
+	unknownMayConsumeNext := false
 	for i := 0; i < len(args); i++ {
 		name, inline, hasInline := strings.Cut(args[i], "=")
 		if boolAllowed[name] {
@@ -286,7 +286,9 @@ func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
 		}
 		if !valuesAllowed[name] {
 			invalid = true
-			unknownSeen = true
+			if !hasInline {
+				unknownMayConsumeNext = true
+			}
 			continue
 		}
 		if result.hasValue(name) {
@@ -311,7 +313,7 @@ func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
 			continue
 		}
 		result.values[name] = value
-		if name == "--request-id" && unknownSeen {
+		if name == "--request-id" && unknownMayConsumeNext {
 			result.ambiguous[name] = true
 		}
 	}

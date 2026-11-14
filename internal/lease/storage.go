@@ -90,6 +90,46 @@ func openStore(stateDir string, ownerUID int64, clock Clock) (*Store, error) {
 	return store, nil
 }
 
+func preflightStoreBeforeStaleSocketRemoval(stateDir string, ownerUID int64) error {
+	dbPath := filepath.Join(stateDir, "leases.sqlite")
+	info, err := os.Lstat(dbPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return rejectFinalSidecars(stateDir)
+	}
+	if err != nil {
+		return errUnsafePath
+	}
+	if err := checkOwnedFile(dbPath, info, uint32(ownerUID), 0600); err != nil {
+		return err
+	}
+	if err := checkSQLiteSidecars(stateDir, uint32(ownerUID)); err != nil {
+		return err
+	}
+	db, err := sqlite.OpenReadOnly(dbPath)
+	if err != nil {
+		return errStorage
+	}
+	validateErr := validateDatabase(db, ownerUID)
+	closeErr := db.Close()
+	if validateErr != nil {
+		return validateErr
+	}
+	if closeErr != nil {
+		return errStorage
+	}
+	if err := checkSQLiteSidecars(stateDir, uint32(ownerUID)); err != nil {
+		return err
+	}
+	currentInfo, err := os.Lstat(dbPath)
+	if err != nil || !os.SameFile(info, currentInfo) {
+		return errUnsafePath
+	}
+	if err := checkOwnedFile(dbPath, currentInfo, uint32(ownerUID), 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, clock Clock) error {
