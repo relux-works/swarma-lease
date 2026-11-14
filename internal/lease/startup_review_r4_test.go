@@ -80,7 +80,7 @@ func TestLateSocketParentRefusalPreservesRecoveryState(t *testing.T) {
 	}
 }
 
-// TestInvalidDatabasePreservesProvenStaleSocket proves database verification failure leaves a proven-stale socket inode and all six canonical tables untouched; restoring the schema version is the positive startup control.
+// TestInvalidDatabasePreservesProvenStaleSocket proves database verification failure leaves a proven-stale socket inode and all six canonical tables untouched; restoring the schema version permits a live mode-0600 socket.
 func TestInvalidDatabasePreservesProvenStaleSocket(t *testing.T) {
 	stateDir := filepath.Join(shortTestDir(t), "state")
 	dbPath := writeCanonicalV1Fixture(t, stateDir, int64(os.Geteuid()))
@@ -158,8 +158,18 @@ func TestInvalidDatabasePreservesProvenStaleSocket(t *testing.T) {
 	}
 	defer recovered.Close()
 	currentInfo, err := os.Lstat(socketPath)
-	if err != nil || os.SameFile(staleInfo, currentInfo) || currentInfo.Mode().Perm() != 0600 {
-		t.Fatalf("valid startup socket = %#v, stat error=%v; want a new mode-0600 socket", currentInfo, err)
+	if err != nil {
+		t.Fatalf("stat valid startup socket: %v", err)
+	}
+	if currentInfo.Mode().Perm() != 0600 {
+		t.Fatalf("valid startup socket mode = %04o; want 0600", currentInfo.Mode().Perm())
+	}
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatalf("dial valid startup socket: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close valid startup socket connection: %v", err)
 	}
 	state, result, code := recovered.store.Status("fixture-active", "")
 	request, requestOK := result["request"].(*RequestRecord)
