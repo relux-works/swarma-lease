@@ -113,12 +113,13 @@ func (s *Server) handleJSON(raw []byte) (Response, bool) {
 	if hasOperationString && knownOperation(opName) {
 		responseOp = opName
 	}
+	responseID := earlyResponseID(top, opName)
 	var version int64
 	if !parseIntField(top["version"], &version) {
-		return response(responseOp, "", "error", "invalid_request", emptyData()), false
+		return response(responseOp, responseID, "error", "invalid_request", emptyData()), false
 	}
 	if version != 1 {
-		return response(responseOp, "", "error", "unsupported_version", emptyData()), false
+		return response(responseOp, responseID, "error", "unsupported_version", emptyData()), false
 	}
 	if len(top["op"]) == 0 || !hasOperationString {
 		return response("protocol", "", "error", "invalid_request", emptyData()), false
@@ -127,7 +128,6 @@ func (s *Server) handleJSON(raw []byte) (Response, bool) {
 		return response("protocol", "", "error", "unknown_operation", emptyData()), false
 	}
 	requestID := ""
-	responseID := ""
 	if isKeyOperation(opName) {
 		if len(top["request_id"]) == 0 {
 			return response(opName, "", "error", "invalid_request", emptyData()), false
@@ -382,6 +382,34 @@ func knownOperation(op string) bool {
 
 func isKeyOperation(op string) bool {
 	return op == "lease.acquire" || op == "lease.wait" || op == "lease.cancel"
+}
+
+func earlyResponseID(top map[string]json.RawMessage, op string) string {
+	var rawID json.RawMessage
+	switch {
+	case isKeyOperation(op):
+		rawID = top["request_id"]
+	case op == "lease.status":
+		if !onlyKeys(top, "version", "type", "op", "data") {
+			return ""
+		}
+		messageType, validType := jsonStringValue(top["type"])
+		if !validType || messageType != "request" {
+			return ""
+		}
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal(top["data"], &data); err != nil || data == nil || len(data) != 1 || !onlyKeys(data, "request_id") {
+			return ""
+		}
+		rawID = data["request_id"]
+	default:
+		return ""
+	}
+	candidate, validType := jsonStringValue(rawID)
+	if validType && requestIDPattern.MatchString(candidate) {
+		return candidate
+	}
+	return ""
 }
 
 func optionalRequestKey(op string) []string {

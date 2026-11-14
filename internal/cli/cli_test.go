@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/relux-works/swarma-lease/internal/lease"
+	"github.com/relux-works/swarma-lease/internal/sqlite"
 )
 
 type result struct {
@@ -72,6 +73,22 @@ func runJSON(t *testing.T, socket string, args ...string) (int, result) {
 		t.Fatalf("decode one JSON result %q: %v", stdout.String(), err)
 	}
 	return exit, got
+}
+
+func assertStoredRequestRefusal(t *testing.T, socket string, code int, got result, wantExit int, wantCode, wantID string) {
+	t.Helper()
+	if code != wantExit || got.State != "error" || got.Code != wantCode || got.RequestID != wantID || len(got.Data) != 3 {
+		t.Fatalf("stored refusal = (%d,%#v), want exit=%d code=%s key=%q and request-result data", code, got, wantExit, wantCode, wantID)
+	}
+	request, ok := got.Data["request"].(map[string]any)
+	if !ok || request["request_id"] != wantID || request["state"] != "refused" || request["outcome_code"] != wantCode || got.Data["lease"] != nil || got.Data["resource"] != nil {
+		t.Fatalf("stored refusal data = %#v, want refused request and null lease/resource", got.Data)
+	}
+	statusCode, status := runJSON(t, socket, "lease", "status", "--request-id", wantID, "--json")
+	statusRequest, statusOK := status.Data["request"].(map[string]any)
+	if statusCode != 0 || status.State != "refused" || status.Code != "" || status.RequestID != wantID || len(status.Data) != 3 || !statusOK || statusRequest["request_id"] != wantID || statusRequest["state"] != "refused" || statusRequest["outcome_code"] != wantCode || status.Data["lease"] != nil || status.Data["resource"] != nil {
+		t.Fatalf("stored refusal status = (%d,%#v), want durable refused request %q with outcome %s", statusCode, status, wantID, wantCode)
+	}
 }
 
 func assertServiceSnapshot(t *testing.T, got result, wantActive, wantQueued float64, resourceID, wantState string, wantToken float64) {
@@ -161,20 +178,18 @@ func TestAcquisitionRefusalsKeepTheirState(t *testing.T) {
 		t.Fatalf("resource add = (%d, %#v), want success", code, got)
 	}
 
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "Bad Tag", "--duration", "10s", "--no-wait", "--request-id", "bad-tag", "--json"); code != 2 || got.Code != "invalid_tag" {
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "Bad Tag", "--duration", "10s", "--no-wait", "--request-id", "bad-tag", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_tag" || got.RequestID != "" || len(got.Data) != 0 {
 		t.Fatalf("malformed tag = (%d, %#v), want invalid_tag", code, got)
 	}
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "0s", "--no-wait", "--request-id", "bad-duration", "--json"); code != 2 || got.Code != "invalid_duration" {
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "0s", "--no-wait", "--request-id", "bad-duration", "--json"); code != 2 || got.State != "error" || got.Code != "invalid_duration" || got.RequestID != "" || len(got.Data) != 0 {
 		t.Fatalf("nonpositive duration = (%d, %#v), want invalid_duration", code, got)
 	}
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "21m", "--no-wait", "--request-id", "long-duration", "--json"); code != 5 || got.Code != "duration_exceeds_max" {
-		t.Fatalf("over-limit duration = (%d, %#v), want duration_exceeds_max", code, got)
-	}
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.missing", "--duration", "10s", "--no-wait", "--request-id", "unknown-tag", "--json"); code != 3 || got.Code != "unknown_tag" {
-		t.Fatalf("unknown tag = (%d, %#v), want unknown_tag", code, got)
-	}
+	durationCode, durationRefusal := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "21m", "--no-wait", "--request-id", "long-duration", "--json")
+	assertStoredRequestRefusal(t, socket, durationCode, durationRefusal, 5, "duration_exceeds_max", "long-duration")
+	unknownTagCode, unknownTagRefusal := runJSON(t, socket, "lease", "request", "--tag", "qa.missing", "--duration", "10s", "--no-wait", "--request-id", "unknown-tag", "--json")
+	assertStoredRequestRefusal(t, socket, unknownTagCode, unknownTagRefusal, 3, "unknown_tag", "unknown-tag")
 	for _, requestID := range []string{"bad-tag", "bad-duration"} {
-		if code, got := runJSON(t, socket, "lease", "status", "--request-id", requestID, "--json"); code != 3 || got.Code != "unknown_request" {
+		if code, got := runJSON(t, socket, "lease", "status", "--request-id", requestID, "--json"); code != 3 || got.State != "error" || got.Code != "unknown_request" || got.RequestID != requestID || len(got.Data) != 0 {
 			t.Fatalf("status for malformed request %s = (%d, %#v), want no persisted request", requestID, code, got)
 		}
 	}
@@ -190,9 +205,7 @@ func TestAcquisitionRefusalsKeepTheirState(t *testing.T) {
 		t.Fatalf("control grant lease = %#v, want a lease record", control.Data["lease"])
 	}
 	busyCode, busy := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "10s", "--no-wait", "--request-id", "req-active-2", "--json")
-	if busyCode != 75 || busy.Code != "no_wait_busy" {
-		t.Fatalf("exhausted no-wait request = (%d, %#v), want no_wait_busy", busyCode, busy)
-	}
+	assertStoredRequestRefusal(t, socket, busyCode, busy, 75, "no_wait_busy", "req-active-2")
 	activeCode, activeStatus := runJSON(t, socket, "lease", "status", "--request-id", "req-active", "--json")
 	if activeCode != 0 || activeStatus.State != "leased" {
 		t.Fatalf("active request status = (%d, %#v), want original lease", activeCode, activeStatus)
@@ -222,8 +235,17 @@ func TestRequestIDConflictDoesNotReplaceTheGrant(t *testing.T) {
 	if !ok {
 		t.Fatalf("original lease = %#v, want a lease record", original.Data["lease"])
 	}
-	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "11s", "--no-wait", "--request-id", "same-key", "--json"); code != 5 || got.Code != "request_id_conflict" {
-		t.Fatalf("changed request = (%d, %#v), want request_id_conflict", code, got)
+	_, beforeConflict := runJSON(t, socket, "service", "status", "--json")
+	beforeCounts := beforeConflict.Data["counts"].(map[string]any)
+	conflictCode, conflict := runJSON(t, socket, "lease", "request", "--tag", "qa.pool", "--duration", "11s", "--no-wait", "--request-id", "same-key", "--json")
+	if conflictCode != 5 || conflict.State != "error" || conflict.Code != "request_id_conflict" || conflict.RequestID != "same-key" || len(conflict.Data) != 3 {
+		t.Fatalf("changed request = (%d,%#v), want request-result conflict for same-key", conflictCode, conflict)
+	}
+	request, requestOK := conflict.Data["request"].(map[string]any)
+	leaseRecord, leaseRecordOK := conflict.Data["lease"].(map[string]any)
+	resource, resourceOK := conflict.Data["resource"].(map[string]any)
+	if !requestOK || request["request_id"] != "same-key" || request["state"] != "leased" || request["duration_ns"] != float64(10*time.Second) || !leaseRecordOK || leaseRecord["id"] != originalLease["id"] || !resourceOK || resource["id"] != "qa-01" || resource["state"] != "leased" {
+		t.Fatalf("conflict response = %#v, want only the original committed request/lease/resource", conflict.Data)
 	}
 	statusCode, statusByRequest := runJSON(t, socket, "lease", "status", "--request-id", "same-key", "--json")
 	leaseAfterConflict, leaseOK := statusByRequest.Data["lease"].(map[string]any)
@@ -232,6 +254,10 @@ func TestRequestIDConflictDoesNotReplaceTheGrant(t *testing.T) {
 	}
 	_, status := runJSON(t, socket, "service", "status", "--json")
 	assertServiceSnapshot(t, status, 1, 0, "qa-01", "leased", 1)
+	afterCounts := status.Data["counts"].(map[string]any)
+	if beforeCounts["audit_rows"] != afterCounts["audit_rows"] {
+		t.Fatalf("conflict changed audit count from %v to %v", beforeCounts["audit_rows"], afterCounts["audit_rows"])
+	}
 }
 
 // TestInvalidCLIInputsDoNotReserveState proves malformed resource and request IDs are rejected before connecting, while a neighboring canonical resource addition commits normally.
@@ -441,6 +467,142 @@ func TestAutoKeyedCLIInterruptionReturnsItsDurableKey(t *testing.T) {
 	if err := <-peerDone; err != nil {
 		t.Fatalf("client sent another frame after queued interruption: %v", err)
 	}
+}
+
+// TestAutoKeyedServiceInterruptionPreservesQueuedRequest proves a real service keeps an auto-keyed waiter and its original monotonic deadline after the CLI is interrupted, and that status plus a later wait recover the single committed grant.
+func TestAutoKeyedServiceInterruptionPreservesQueuedRequest(t *testing.T) {
+	_, socket := startFixture(t)
+	stateDir := filepath.Join(filepath.Dir(socket), "state")
+	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.interrupt", "--id", "interrupt-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
+		t.Fatalf("resource add = (%d,%#v), want added", code, got)
+	}
+	holderCode, holder := runJSON(t, socket, "lease", "request", "--tag", "qa.interrupt", "--duration", "10m", "--no-wait", "--request-id", "interrupt-holder", "--json")
+	if holderCode != 0 || holder.State != "granted" {
+		t.Fatalf("holder acquisition = (%d,%#v), want grant", holderCode, holder)
+	}
+	holderLease, ok := holder.Data["lease"].(map[string]any)
+	holderLeaseID, idOK := holderLease["id"].(string)
+	if !ok || !idOK || holderLeaseID == "" {
+		t.Fatalf("holder lease = %#v, want lease ID", holder.Data["lease"])
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct {
+		code   int
+		stdout string
+		stderr string
+	}, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		code := runAtSocketContext(ctx, []string{"lease", "request", "--tag", "qa.interrupt", "--duration", "10s", "--wait", "--wait-timeout", "20m", "--json"}, &stdout, &stderr, socket)
+		finished <- struct {
+			code   int
+			stdout string
+			stderr string
+		}{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}()
+	completed := false
+	t.Cleanup(func() {
+		cancel()
+		if !completed {
+			select {
+			case <-finished:
+			case <-time.After(3 * time.Second):
+				t.Error("auto-keyed CLI did not stop after cleanup cancellation")
+			}
+		}
+	})
+
+	queued := waitForQueuedRequestRow(t, stateDir, "qa.interrupt")
+	requestID, idOK := queued["request_id"].(string)
+	deadline, deadlineOK := queued["wait_deadline_monotonic_ns"].(int64)
+	bootID, bootOK := queued["queue_boot_session_id"].(string)
+	if !idOK || len(requestID) != 32 || strings.Trim(requestID, "0123456789abcdef") != "" || !deadlineOK || !bootOK || bootID == "" {
+		t.Fatalf("queued auto-key row = %#v, want generated key and persisted deadline/epoch", queued)
+	}
+	cancel()
+	var cliResult struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	select {
+	case cliResult = <-finished:
+		completed = true
+	case <-time.After(3 * time.Second):
+		t.Fatal("service-backed CLI did not return after interruption")
+	}
+	var interrupted result
+	if err := json.Unmarshal([]byte(cliResult.stdout), &interrupted); err != nil {
+		t.Fatalf("decode interrupted service-backed CLI output %q: %v", cliResult.stdout, err)
+	}
+	if cliResult.code != 130 || interrupted.State != "error" || interrupted.Code != "client_interrupted" || interrupted.RequestID != requestID || interrupted.Data["attempt_state"] != "unknown" || cliResult.stderr != "" {
+		t.Fatalf("service-backed interruption = (%d,%#v,stderr=%q), want unknown result for %s", cliResult.code, interrupted, cliResult.stderr, requestID)
+	}
+
+	statusCode, status := runJSON(t, socket, "lease", "status", "--request-id", requestID, "--json")
+	if statusCode != 0 || status.State != "queued" || status.RequestID != requestID {
+		t.Fatalf("status after interruption = (%d,%#v), want original queued request", statusCode, status)
+	}
+	if current := readRequestRow(t, stateDir, requestID); current["state"] != "queued" || current["wait_deadline_monotonic_ns"] != deadline || current["queue_boot_session_id"] != bootID {
+		t.Fatalf("queued request changed after interruption: %#v; want deadline=%d epoch=%s", current, deadline, bootID)
+	}
+
+	if code, released := runJSON(t, socket, "lease", "release", "--id", holderLeaseID, "--json"); code != 0 || released.State != "released" {
+		t.Fatalf("release holder = (%d,%#v), want released", code, released)
+	}
+	waitCode, recovered := runJSON(t, socket, "lease", "wait", "--request-id", requestID, "--json")
+	if waitCode != 0 || recovered.State != "granted" || recovered.RequestID != requestID || recovered.Data["lease"] == nil || recovered.Data["resource"] == nil {
+		t.Fatalf("wait recovery = (%d,%#v), want the committed grant", waitCode, recovered)
+	}
+	if after := readRequestRow(t, stateDir, requestID); after["state"] != "leased" || after["wait_deadline_monotonic_ns"] != deadline || after["queue_boot_session_id"] != bootID {
+		t.Fatalf("request changed after grant recovery: %#v; original deadline=%d epoch=%s", after, deadline, bootID)
+	}
+	db, err := sqlite.Open(filepath.Join(stateDir, "leases.sqlite"))
+	if err != nil {
+		t.Fatalf("open service database for audit check: %v", err)
+	}
+	defer db.Close()
+	audits, err := db.Query("SELECT COUNT(*) AS count FROM audit WHERE request_id=?", requestID)
+	if err != nil || len(audits) != 1 || audits[0]["count"] != int64(4) {
+		t.Fatalf("queued/granted audit rows = %#v, %v; want one queued transition and three grant transitions", audits, err)
+	}
+}
+
+func waitForQueuedRequestRow(t *testing.T, stateDir, tag string) sqlite.Row {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		db, err := sqlite.Open(filepath.Join(stateDir, "leases.sqlite"))
+		if err != nil {
+			t.Fatalf("open service database while awaiting queued request: %v", err)
+		}
+		rows, queryErr := db.Query("SELECT request_id,state,wait_deadline_monotonic_ns,queue_boot_session_id FROM requests WHERE tag=? AND state='queued' ORDER BY queue_sequence DESC LIMIT 1", tag)
+		closeErr := db.Close()
+		if queryErr != nil || closeErr != nil {
+			t.Fatalf("read queued request row: query=%v close=%v", queryErr, closeErr)
+		}
+		if len(rows) == 1 {
+			return rows[0]
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("auto-keyed request never reached durable queued state")
+	return nil
+}
+
+func readRequestRow(t *testing.T, stateDir, requestID string) sqlite.Row {
+	t.Helper()
+	db, err := sqlite.Open(filepath.Join(stateDir, "leases.sqlite"))
+	if err != nil {
+		t.Fatalf("open service database: %v", err)
+	}
+	rows, queryErr := db.Query("SELECT request_id,state,wait_deadline_monotonic_ns,queue_boot_session_id FROM requests WHERE request_id=?", requestID)
+	closeErr := db.Close()
+	if queryErr != nil || closeErr != nil || len(rows) != 1 {
+		t.Fatalf("read request row: rows=%#v query=%v close=%v", rows, queryErr, closeErr)
+	}
+	return rows[0]
 }
 
 // TestRejectedCLIInputDoesNotEchoPrivateValue proves a malformed private-looking argument is refused locally and absent from stdout and stderr.
