@@ -26,8 +26,9 @@ type commandError struct {
 }
 
 type parsedFlags struct {
-	values map[string]string
-	bools  map[string]bool
+	values    map[string]string
+	bools     map[string]bool
+	ambiguous map[string]bool
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -134,14 +135,9 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		flagArgs = args[1:]
 	}
 	flags, err := parseFlags(flagArgs, valueFlags, boolFlags)
+	safeRequestID := knownRequestID(mode, flags)
 	if err != nil || !flags.bools["--json"] {
-		return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
-	}
-	safeRequestID := ""
-	if mode == "lease-request" {
-		if candidate := flags.values["--request-id"]; validRequestID(candidate) {
-			safeRequestID = candidate
-		}
+		return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_request"}
 	}
 	data := make(map[string]any)
 	switch mode {
@@ -275,33 +271,74 @@ func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
 	for _, name := range boolNames {
 		boolAllowed[name] = true
 	}
-	result := parsedFlags{values: make(map[string]string), bools: make(map[string]bool)}
+	result := parsedFlags{values: make(map[string]string), bools: make(map[string]bool), ambiguous: make(map[string]bool)}
+	invalid := false
+	unknownSeen := false
 	for i := 0; i < len(args); i++ {
 		name, inline, hasInline := strings.Cut(args[i], "=")
 		if boolAllowed[name] {
 			if hasInline || result.bools[name] {
-				return parsedFlags{}, errors.New("invalid flags")
+				invalid = true
+				continue
 			}
 			result.bools[name] = true
 			continue
 		}
-		if !valuesAllowed[name] || result.hasValue(name) {
-			return parsedFlags{}, errors.New("invalid flags")
+		if !valuesAllowed[name] {
+			invalid = true
+			unknownSeen = true
+			continue
+		}
+		if result.hasValue(name) {
+			result.ambiguous[name] = true
+			invalid = true
+			if !hasInline && i+1 < len(args) {
+				i++
+			}
+			continue
 		}
 		value := inline
 		if !hasInline {
 			if i+1 >= len(args) {
-				return parsedFlags{}, errors.New("missing value")
+				invalid = true
+				continue
 			}
 			i++
 			value = args[i]
 		}
 		if value == "" {
-			return parsedFlags{}, errors.New("missing value")
+			invalid = true
+			continue
 		}
 		result.values[name] = value
+		if name == "--request-id" && unknownSeen {
+			result.ambiguous[name] = true
+		}
+	}
+	if invalid {
+		return result, errors.New("invalid flags")
 	}
 	return result, nil
+}
+
+func knownRequestID(mode string, flags parsedFlags) string {
+	switch mode {
+	case "lease-request", "lease-key":
+	case "lease-status":
+		if flags.hasValue("--id") {
+			return ""
+		}
+	default:
+		return ""
+	}
+	if flags.ambiguous["--request-id"] {
+		return ""
+	}
+	candidate := flags.values["--request-id"]
+	if !validRequestID(candidate) {
+		return ""
+	}
+	return candidate
 }
 
 func (f parsedFlags) hasValue(name string) bool {

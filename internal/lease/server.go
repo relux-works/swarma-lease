@@ -39,6 +39,12 @@ type Server struct {
 	closeErr   error
 }
 
+// POSIX access(2) permission bits; syscall does not export these on Darwin.
+const (
+	accessExecute = 0x01
+	accessWrite   = 0x02
+)
+
 func Start(config Config) (*Server, error) {
 	uid := os.Geteuid()
 	if uid == 0 {
@@ -91,6 +97,7 @@ func Start(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	var staleSocketInfo os.FileInfo
 	if info, err := os.Lstat(socketPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
 			unlockClose(lockFile)
@@ -105,18 +112,32 @@ func Start(config Config) (*Server, error) {
 			unlockClose(lockFile)
 			return nil, errBadMode
 		}
-		if err := removeProvenStaleSocket(socketPath, info, uint32(uid)); err != nil {
+		if err := proveStaleSocket(socketPath, info, uint32(uid)); err != nil {
 			unlockClose(lockFile)
 			return nil, err
 		}
+		staleSocketInfo = info
 	} else if !errors.Is(err, os.ErrNotExist) {
 		unlockClose(lockFile)
 		return nil, errUnsafePath
+	}
+	if socketParent != stateDir {
+		if err := syscall.Access(socketParent, accessWrite|accessExecute); err != nil {
+			unlockClose(lockFile)
+			return nil, errUnsafePath
+		}
 	}
 	store, err := openStore(stateDir, int64(uid), clock)
 	if err != nil {
 		unlockClose(lockFile)
 		return nil, err
+	}
+	if staleSocketInfo != nil {
+		if err := removeProvenStaleSocket(socketPath, staleSocketInfo, uint32(uid)); err != nil {
+			_ = store.Close()
+			unlockClose(lockFile)
+			return nil, err
+		}
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
@@ -165,7 +186,7 @@ func Start(config Config) (*Server, error) {
 	return &Server{stateDir: stateDir, socketPath: socketPath, ownerUID: int64(uid), clock: clock, store: store, listener: listener, lockFile: lockFile, socketInfo: socketInfo, active: make(map[net.Conn]struct{}), done: make(chan struct{})}, nil
 }
 
-func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) error {
+func proveStaleSocket(path string, original os.FileInfo, uid uint32) error {
 	conn, err := net.DialTimeout("unix", path, time.Second)
 	if err == nil {
 		_ = conn.Close()
@@ -181,6 +202,13 @@ func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) erro
 	stat, ok := current.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uid || current.Mode().Perm() != 0600 {
 		return errors.New("socket_stale_uncertain")
+	}
+	return nil
+}
+
+func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) error {
+	if err := proveStaleSocket(path, original, uid); err != nil {
+		return err
 	}
 	if err := os.Remove(path); err != nil {
 		return errors.New("socket_stale_uncertain")

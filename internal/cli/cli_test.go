@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -313,6 +314,55 @@ func TestInvalidCLIInputsDoNotReserveState(t *testing.T) {
 	}
 	if code, got := runJSON(t, socket, "service", "status", "--json"); code != 0 || got.Data["counts"].(map[string]any)["audit_rows"] != float64(1) {
 		t.Fatalf("status after invalid inputs = (%d, %#v), want only the valid addition audited", code, got)
+	}
+}
+
+// TestLocalFlagErrorsKeepOnlyKnownRequestKeys proves the actual CLI preserves a valid unique key on early flag refusals, suppresses invalid or duplicate keys, leaves service state unchanged, and permits a later valid acquisition with the same key.
+func TestLocalFlagErrorsKeepOnlyKnownRequestKeys(t *testing.T) {
+	_, socket := startFixture(t)
+	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.keys", "--id", "keys-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
+		t.Fatalf("key fixture resource = (%d, %#v), want added", code, got)
+	}
+	const requestID = "syntax-key"
+	statusCode, before := runJSON(t, socket, "service", "status", "--json")
+	if statusCode != 0 {
+		t.Fatalf("initial service snapshot = (%d, %#v), want success", statusCode, before)
+	}
+	cases := []struct {
+		name    string
+		args    []string
+		wantKey string
+	}{
+		{
+			name:    "acquire-missing-json",
+			args:    []string{"lease", "request", "--tag", "qa.keys", "--duration", "10s", "--no-wait", "--request-id", requestID},
+			wantKey: requestID,
+		},
+		{name: "wait-missing-json", args: []string{"lease", "wait", "--request-id", requestID}, wantKey: requestID},
+		{name: "cancel-missing-json", args: []string{"lease", "cancel", "--request-id", requestID}, wantKey: requestID},
+		{name: "status-missing-json", args: []string{"lease", "status", "--request-id", requestID}, wantKey: requestID},
+		{name: "wait-before-unknown-flag", args: []string{"lease", "wait", "--request-id", requestID, "--unknown"}, wantKey: requestID},
+		{name: "wait-before-duplicate-json", args: []string{"lease", "wait", "--request-id", requestID, "--json", "--json"}, wantKey: requestID},
+		{name: "wait-after-unknown-flag-suppresses", args: []string{"lease", "wait", "--unknown", "--request-id", requestID}},
+		{name: "duplicate-key-suppressed", args: []string{"lease", "wait", "--request-id", requestID, "--request-id", "other-key", "--json"}},
+		{name: "duplicate-key-after-unknown-suppressed", args: []string{"lease", "wait", "--request-id", requestID, "--unknown", "--request-id", "other-key"}},
+		{name: "invalid-key-suppressed", args: []string{"lease", "wait", "--request-id", "bad key", "--unknown"}},
+		{name: "status-with-lease-id-suppressed", args: []string{"lease", "status", "--request-id", requestID, "--id", "00000000000000000000000000000001", "--unknown"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, got := runJSON(t, socket, tc.args...)
+			if code != 2 || got.State != "error" || got.Code != "invalid_request" || got.RequestID != tc.wantKey || len(got.Data) != 0 {
+				t.Fatalf("local flag refusal = (%d, %#v), want invalid_request with key %q", code, got, tc.wantKey)
+			}
+			statusCode, after := runJSON(t, socket, "service", "status", "--json")
+			if statusCode != 0 || !reflect.DeepEqual(after.Data, before.Data) {
+				t.Fatalf("local flag refusal changed service snapshot: before=%#v after=(%d,%#v)", before.Data, statusCode, after.Data)
+			}
+		})
+	}
+	if code, got := runJSON(t, socket, "lease", "request", "--tag", "qa.keys", "--duration", "10s", "--no-wait", "--request-id", requestID, "--json"); code != 0 || got.State != "granted" || got.RequestID != requestID {
+		t.Fatalf("valid same-key acquisition = (%d, %#v), want a grant with %q", code, got, requestID)
 	}
 }
 
