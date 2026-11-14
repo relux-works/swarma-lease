@@ -34,6 +34,8 @@ type Server struct {
 	workers    sync.WaitGroup
 	closing    bool
 	closeOnce  sync.Once
+	doneOnce   sync.Once
+	done       chan struct{}
 	closeErr   error
 }
 
@@ -154,7 +156,7 @@ func Start(config Config) (*Server, error) {
 		unlockClose(lockFile)
 		return nil, errBadMode
 	}
-	return &Server{stateDir: stateDir, socketPath: socketPath, ownerUID: int64(uid), clock: clock, store: store, listener: listener, lockFile: lockFile, socketInfo: socketInfo, active: make(map[net.Conn]struct{})}, nil
+	return &Server{stateDir: stateDir, socketPath: socketPath, ownerUID: int64(uid), clock: clock, store: store, listener: listener, lockFile: lockFile, socketInfo: socketInfo, active: make(map[net.Conn]struct{}), done: make(chan struct{})}, nil
 }
 
 func removeProvenStaleSocket(path string, original os.FileInfo, uid uint32) error {
@@ -354,13 +356,20 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.stopServing()
 	})
 	defer stop()
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.runScheduler(ctx)
+	}()
 	for {
 		conn, err := s.listener.AcceptUnix()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				s.stopServing()
 				s.workers.Wait()
 				return nil
 			}
+			s.stopServing()
 			s.workers.Wait()
 			return errors.New("daemon_unavailable")
 		}
@@ -417,12 +426,122 @@ func (s *Server) serveConn(conn *net.UnixConn) {
 			return
 		}
 		result, malformed := s.handleBytes(frame, uid)
-		if writeResponse(conn, result) != nil {
+		if result.State == "queued" && (result.Op == "lease.acquire" || result.Op == "lease.wait") {
+			if s.serveWait(conn, result) != nil {
+				return
+			}
+		} else if writeResponse(conn, result) != nil {
 			return
 		}
 		if malformed {
 			return
 		}
+	}
+}
+
+func (s *Server) serveWait(conn net.Conn, queued Response) error {
+	subscription, err := s.store.subscribeRequest(queued.RequestID)
+	if err != nil {
+		return writeResponse(conn, response(queued.Op, queued.RequestID, "error", "result_unknown", emptyData()))
+	}
+	defer subscription.cancel()
+	if err := writeResponse(conn, queued); err != nil {
+		return err
+	}
+	event, ok := subscription.wait(s.done)
+	if !ok {
+		return net.ErrClosed
+	}
+	return writeTerminalEvent(conn, event)
+}
+
+func (s *Server) runScheduler(ctx context.Context) {
+	for {
+		changed := s.store.changes()
+		sample, err := s.clock.Read()
+		if err != nil {
+			if !s.waitSchedulerRetry(ctx, changed) {
+				return
+			}
+			continue
+		}
+		if _, code := s.store.RunScheduler(sample); code != "" {
+			if !s.waitSchedulerRetry(ctx, changed) {
+				return
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.done:
+			return
+		case <-changed:
+			continue
+		default:
+		}
+
+		sample, err = s.clock.Read()
+		if err != nil {
+			if !s.waitSchedulerRetry(ctx, changed) {
+				return
+			}
+			continue
+		}
+		delay, hasDeadline, err := s.store.nextWakeDelay(sample)
+		if err != nil {
+			if !s.waitSchedulerRetry(ctx, changed) {
+				return
+			}
+			continue
+		}
+		if !hasDeadline {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.done:
+				return
+			case <-changed:
+				continue
+			}
+		}
+		if delay <= 0 {
+			delay = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-s.done:
+			timer.Stop()
+			return
+		case <-changed:
+			timer.Stop()
+		case <-timer.C:
+			sample, err := s.clock.Read()
+			if err == nil {
+				_, _ = s.store.RunScheduler(sample)
+			}
+		}
+	}
+}
+
+func (s *Server) waitSchedulerRetry(ctx context.Context, changed <-chan struct{}) bool {
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.done:
+		return false
+	case <-changed:
+		return true
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -445,9 +564,31 @@ func writeResponse(conn net.Conn, result Response) error {
 	return nil
 }
 
+func writeTerminalEvent(conn net.Conn, event TerminalEvent) error {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	for len(encoded) > 0 {
+		n, err := conn.Write(encoded)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errors.New("short write")
+		}
+		encoded = encoded[n:]
+	}
+	return nil
+}
+
 func (s *Server) stopServing() {
 	s.mu.Lock()
-	s.closing = true
+	if !s.closing {
+		s.closing = true
+		s.doneOnce.Do(func() { close(s.done) })
+	}
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}

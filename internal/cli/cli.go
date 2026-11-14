@@ -50,7 +50,9 @@ func RunAtSocket(args []string, stdout, stderr io.Writer, socket string) int {
 	if parseErr != nil {
 		return writeCLIError(stdout, parseErr.op, parseErr.requestID, parseErr.code)
 	}
-	result, _ := lease.Exchange(socket, request)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, _ := lease.ExchangeContext(ctx, socket, request)
 	return writeResponse(stdout, result)
 }
 
@@ -105,6 +107,9 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	case args[0] == "lease" && args[1] == "request":
 		request.Op, mode = "lease.acquire", "lease-request"
 		valueFlags, boolFlags = []string{"--tag", "--duration", "--wait-timeout", "--request-id"}, []string{"--wait", "--no-wait", "--json"}
+	case args[0] == "lease" && (args[1] == "wait" || args[1] == "cancel"):
+		request.Op, mode = "lease."+args[1], "lease-key"
+		valueFlags, boolFlags = []string{"--request-id"}, []string{"--json"}
 	case args[0] == "lease" && args[1] == "release":
 		request.Op, mode = "lease.release", "lease-release"
 		valueFlags, boolFlags = []string{"--id"}, []string{"--json"}
@@ -195,6 +200,12 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		if waitTimeout != nil {
 			data["wait_timeout_ns"] = *waitTimeout
 		}
+	case "lease-key":
+		requestID := flags.values["--request-id"]
+		if !validRequestID(requestID) {
+			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request_id"}
+		}
+		request.RequestID = requestID
 	case "lease-release":
 		id := flags.values["--id"]
 		if !validLeaseID(id) {
@@ -408,6 +419,8 @@ func exitStatus(code string) int {
 		return 5
 	case "no_wait_busy":
 		return 75
+	case "client_interrupted":
+		return 130
 	case "socket_path_too_long":
 		return 69
 	default:

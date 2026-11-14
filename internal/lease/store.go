@@ -19,13 +19,14 @@ type AcquireInput struct {
 }
 
 func (s *Store) recoverBoot(sample Sample) error {
-	return s.db.Transaction(func(tx *sqlite.Tx) error {
+	var events []TerminalEvent
+	err := s.db.Transaction(func(tx *sqlite.Tx) error {
 		rows, err := tx.Query("SELECT boot_session_id FROM settings WHERE singleton_id=1")
 		if err != nil || len(rows) != 1 {
 			return sqlite.ErrStorage
 		}
 		oldBoot := rowString(rows[0], "boot_session_id")
-		if err := s.applyDue(tx, sample, "startup.recovery"); err != nil {
+		if err := s.applyDue(tx, sample, "startup.recovery", &events); err != nil {
 			return err
 		}
 		if oldBoot != sample.BootSessionID {
@@ -33,15 +34,32 @@ func (s *Store) recoverBoot(sample Sample) error {
 				return err
 			}
 		}
-		return nil
+		if err := disableAllExhaustedResources(tx, sample); err != nil {
+			return err
+		}
+		return s.scheduleQueued(tx, sample, &events)
 	})
+	if err == nil {
+		s.publishEvents(events)
+	}
+	return err
 }
 
 func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any, string) {
+	if in.DurationNS <= 0 {
+		return "error", emptyData(), "invalid_duration"
+	}
+	if in.WaitMode != "wait" && in.WaitMode != "no_wait" {
+		return "error", emptyData(), "invalid_wait_mode"
+	}
+	if in.WaitMode == "wait" && (in.WaitTimeoutNS == nil || *in.WaitTimeoutNS <= 0) || in.WaitMode == "no_wait" && in.WaitTimeoutNS != nil {
+		return "error", emptyData(), "invalid_wait_timeout"
+	}
 	var state, code string
 	var data map[string]any
+	var events []TerminalEvent
 	err := s.db.Transaction(func(tx *sqlite.Tx) error {
-		if err := s.applyDue(tx, sample, "scheduler"); err != nil {
+		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
 		old, err := requestByID(tx, in.RequestID)
@@ -74,6 +92,9 @@ func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any,
 		if in.DurationNS > maxLeaseNS {
 			return s.refuse(tx, in, sample, "duration_exceeds_max", &state, &code, &data)
 		}
+		if in.WaitMode == "wait" && *in.WaitTimeoutNS > maxWaitNS {
+			return s.refuse(tx, in, sample, "wait_exceeds_max", &state, &code, &data)
+		}
 		pools, err := tx.Query("SELECT mode FROM pools WHERE tag=?", in.Tag)
 		if err != nil {
 			return err
@@ -84,10 +105,7 @@ func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any,
 		if rowString(pools[0], "mode") == "command" {
 			return s.refuse(tx, in, sample, "adapter_required", &state, &code, &data)
 		}
-		if err := disableExhaustedResources(tx, in.Tag, sample); err != nil {
-			return err
-		}
-		resources, err := tx.Query("SELECT id,fencing_token FROM resources WHERE tag=? AND state='available' ORDER BY id COLLATE BINARY LIMIT 1", in.Tag)
+		resources, err := tx.Query("SELECT id FROM resources WHERE tag=? AND state='available' ORDER BY id COLLATE BINARY LIMIT 1", in.Tag)
 		if err != nil {
 			return err
 		}
@@ -99,40 +117,20 @@ func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any,
 			if rowInt(totalRows[0], "total") > 0 && rowInt(totalRows[0], "total") == rowInt(totalRows[0], "disabled") {
 				return s.refuse(tx, in, sample, "pool_disabled", &state, &code, &data)
 			}
-			return s.refuse(tx, in, sample, "no_wait_busy", &state, &code, &data)
+			if in.WaitMode == "no_wait" {
+				return s.refuse(tx, in, sample, "no_wait_busy", &state, &code, &data)
+			}
+			if err := s.enqueueRequest(tx, in, sample, &state, &code, &data); err != nil {
+				return err
+			}
+			return s.scheduleQueued(tx, sample, &events)
 		}
-		resourceID := rowString(resources[0], "id")
-		oldToken := rowInt(resources[0], "fencing_token")
-		if oldToken == math.MaxInt64 {
-			return sqlite.ErrStorage
-		}
-		fencingToken := oldToken + 1
-		leaseID, err := newID()
+		resource, err := loadResource(tx, rowString(resources[0], "id"))
 		if err != nil {
-			return sqlite.ErrStorage
-		}
-		grantedAt := timestamp(sample.Wall)
-		hardEndAt := timestamp(sample.Wall.Add(time.Duration(in.DurationNS)))
-		hardEndMono := sample.MonotonicNS + in.DurationNS
-		if hardEndMono < sample.MonotonicNS {
-			return s.refuse(tx, in, sample, "duration_exceeds_max", &state, &code, &data)
-		}
-		if _, err := tx.Exec("INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?,? ,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'leased',NULL,?,?)", in.RequestID, in.Tag, in.DurationNS, in.WaitMode, grantedAt, grantedAt); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("UPDATE resources SET state='leased',fencing_token=?,updated_at=? WHERE id=? AND state='available'", fencingToken, grantedAt, resourceID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec("INSERT INTO leases(id,request_id,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token) VALUES(?,?,?,'active',?,?,?,?,?,?,?,NULL,NULL,NULL)", leaseID, in.RequestID, resourceID, in.DurationNS, grantedAt, hardEndAt, sample.BootSessionID, sample.MonotonicNS, hardEndMono, fencingToken); err != nil {
-			return err
-		}
-		if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &in.RequestID, "ok", nil, stringPtr("leased")); err != nil {
-			return err
-		}
-		if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &leaseID, "ok", nil, stringPtr("active")); err != nil {
-			return err
-		}
-		if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &resourceID, "ok", stringPtr("available"), stringPtr("leased")); err != nil {
+		request := RequestRecord{RequestID: in.RequestID, Tag: in.Tag, DurationNS: in.DurationNS, WaitMode: in.WaitMode, WaitTimeout: in.WaitTimeoutNS}
+		if err := grantRequest(tx, sample, request, resource, "lease.acquire", nil); err != nil {
 			return err
 		}
 		data, err = requestResult(tx, in.RequestID)
@@ -145,12 +143,18 @@ func (s *Store) Acquire(in AcquireInput, sample Sample) (string, map[string]any,
 	if err != nil {
 		return "error", emptyData(), storageCode(err)
 	}
+	s.publishEvents(events)
+	s.signalChanged()
 	return state, data, code
 }
 
 func (s *Store) refuse(tx *sqlite.Tx, in AcquireInput, sample Sample, refusal string, state, code *string, data *map[string]any) error {
 	at := timestamp(sample.Wall)
-	if _, err := tx.Exec("INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?, ?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'refused',?,?,?)", in.RequestID, in.Tag, in.DurationNS, in.WaitMode, refusal, at, at); err != nil {
+	var waitTimeout any
+	if in.WaitTimeoutNS != nil {
+		waitTimeout = *in.WaitTimeoutNS
+	}
+	if _, err := tx.Exec("INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,'refused',?,?,?)", in.RequestID, in.Tag, in.DurationNS, in.WaitMode, waitTimeout, refusal, at, at); err != nil {
 		return err
 	}
 	if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &in.RequestID, refusal, nil, stringPtr("refused")); err != nil {
@@ -168,8 +172,9 @@ func (s *Store) refuse(tx *sqlite.Tx, in AcquireInput, sample Sample, refusal st
 func (s *Store) AddResource(tag, id, mode string, sample Sample) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
+	var events []TerminalEvent
 	err := s.db.Transaction(func(tx *sqlite.Tx) error {
-		if err := s.applyDue(tx, sample, "scheduler"); err != nil {
+		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
 		resources, err := tx.Query("SELECT id FROM resources WHERE id=?", id)
@@ -204,21 +209,31 @@ func (s *Store) AddResource(tag, id, mode string, sample Sample) (string, map[st
 		if err != nil {
 			return err
 		}
-		data = map[string]any{"pool": PoolRecord{Tag: tag, Mode: mode}, "resource": resource}
 		state = "added"
+		if err := s.scheduleQueued(tx, sample, &events); err != nil {
+			return err
+		}
+		resource, err = loadResource(tx, id)
+		if err != nil {
+			return err
+		}
+		data = map[string]any{"pool": PoolRecord{Tag: tag, Mode: mode}, "resource": resource}
 		return nil
 	})
 	if err != nil {
 		return "error", emptyData(), storageCode(err)
 	}
+	s.publishEvents(events)
+	s.signalChanged()
 	return state, data, code
 }
 
 func (s *Store) SetResource(operation, id string, confirmStopped bool, sample Sample) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
+	var events []TerminalEvent
 	err := s.db.Transaction(func(tx *sqlite.Tx) error {
-		if err := s.applyDue(tx, sample, "scheduler"); err != nil {
+		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
 		resource, err := loadResource(tx, id)
@@ -275,21 +290,30 @@ func (s *Store) SetResource(operation, id string, confirmStopped bool, sample Sa
 		if err := insertAudit(tx, sample, operation, nil, &id, "ok", stringPtr(resource.State), stringPtr(target)); err != nil {
 			return err
 		}
-		resource.State = target
+		if err := s.scheduleQueued(tx, sample, &events); err != nil {
+			return err
+		}
+		resource, err = loadResource(tx, id)
+		if err != nil {
+			return err
+		}
 		data = map[string]any{"resource": resource}
 		return nil
 	})
 	if err != nil {
 		return "error", emptyData(), storageCode(err)
 	}
+	s.publishEvents(events)
+	s.signalChanged()
 	return state, data, code
 }
 
 func (s *Store) Release(leaseID string, sample Sample) (string, map[string]any, string) {
 	var state, code string
 	var data map[string]any
+	var events []TerminalEvent
 	err := s.db.Transaction(func(tx *sqlite.Tx) error {
-		if err := s.applyDue(tx, sample, "scheduler"); err != nil {
+		if err := s.scheduleTx(tx, sample, "scheduler", &events); err != nil {
 			return err
 		}
 		rows, err := tx.Query("SELECT request_id FROM leases WHERE id=?", leaseID)
@@ -323,11 +347,13 @@ func (s *Store) Release(leaseID string, sample Sample) (string, map[string]any, 
 			return err
 		}
 		state = lease.State
-		return nil
+		return s.scheduleQueued(tx, sample, &events)
 	})
 	if err != nil {
 		return "error", emptyData(), storageCode(err)
 	}
+	s.publishEvents(events)
+	s.signalChanged()
 	return state, data, code
 }
 
@@ -440,7 +466,7 @@ func (s *Store) History(limit int64, before *int64) (map[string]any, string) {
 	return map[string]any{"entries": entries}, ""
 }
 
-func (s *Store) applyDue(tx *sqlite.Tx, sample Sample, operation string) error {
+func (s *Store) applyDue(tx *sqlite.Tx, sample Sample, operation string, events *[]TerminalEvent) error {
 	rows, err := tx.Query("SELECT l.id,l.request_id,l.resource_id,l.state,l.duration_ns,l.granted_at,l.hard_end_at,l.fencing_token,l.boot_session_id,l.granted_monotonic_ns,l.hard_end_monotonic_ns,r.id AS joined_resource_id,r.tag,r.state AS resource_state,r.fencing_token AS resource_fencing_token,p.mode FROM leases l JOIN resources r ON r.id=l.resource_id JOIN pools p ON p.tag=r.tag WHERE l.state='active' ORDER BY l.id COLLATE BINARY")
 	if err != nil {
 		return err
@@ -469,6 +495,11 @@ func (s *Store) applyDue(tx *sqlite.Tx, sample Sample, operation string) error {
 			if err := insertAudit(tx, sample, operation, &id, &id, "request_timed_out", stringPtr("queued"), stringPtr("timed_out")); err != nil {
 				return err
 			}
+			event, _, err := terminalEvent(tx, id)
+			if err != nil || event == nil {
+				return sqlite.ErrStorage
+			}
+			*events = append(*events, *event)
 		}
 	}
 	return nil

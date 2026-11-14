@@ -34,6 +34,24 @@ func newTestServer(t *testing.T) *Server {
 	return server
 }
 
+func newDirectTestServer(t *testing.T) *Server {
+	t.Helper()
+	root := shortTestDir(t)
+	server, err := Start(Config{
+		StateDir:   filepath.Join(root, "state"),
+		SocketPath: filepath.Join(root, "service.sock"),
+	})
+	if err != nil {
+		t.Fatalf("start direct service: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close direct service: %v", err)
+		}
+	})
+	return server
+}
+
 func shortTestDir(t *testing.T) string {
 	t.Helper()
 	createdRoot, err := os.MkdirTemp("", "sl-")
@@ -145,9 +163,9 @@ func TestSQLiteGrantFailureRollsBackEveryTransition(t *testing.T) {
 	}
 }
 
-// TestResourceControlAndRecoveryTransitions proves audit nullable fields, disable/enable idempotency, and the explicit command-resource recovery gate without allowing an invalid source state to change.
+// TestResourceControlAndRecoveryTransitions proves audit nullable fields, disable/enable idempotency, the command-resource recovery gate, and the scheduler transition in a synchronous MAX_INT64 enable refusal without a racing background scheduler.
 func TestResourceControlAndRecoveryTransitions(t *testing.T) {
-	server := newTestServer(t)
+	server := newDirectTestServer(t)
 	uid := uint32(server.ownerUID)
 	add := request(t, server, uid, map[string]any{
 		"version": 1, "type": "request", "op": "resource.add",
@@ -233,8 +251,10 @@ func TestResourceControlAndRecoveryTransitions(t *testing.T) {
 		"version": 1, "type": "request", "op": "service.status", "data": map[string]any{},
 	})
 	beforeMaxCounts, countsOK := beforeMax.Data["counts"].(Counts)
-	if beforeMax.Code != "" || !countsOK {
-		t.Fatalf("status before MAX_INT64 refusal = %#v, want healthy status", beforeMax)
+	beforeMaxPools, poolsOK := beforeMax.Data["pools"].([]PoolStatus)
+	manualBeforeMax := findResource(beforeMaxPools, "manual-01")
+	if beforeMax.Code != "" || !countsOK || !poolsOK || manualBeforeMax == nil || manualBeforeMax.State != "available" || manualBeforeMax.FencingToken != int64(^uint64(0)>>1) {
+		t.Fatalf("status before MAX_INT64 refusal = %#v, want available resource at MAX_INT64", beforeMax)
 	}
 	maxRefusal := request(t, server, uid, map[string]any{
 		"version": 1, "type": "request", "op": "resource.enable",
@@ -249,8 +269,12 @@ func TestResourceControlAndRecoveryTransitions(t *testing.T) {
 	finalPools, poolsOK := finalStatus.Data["pools"].([]PoolStatus)
 	finalCounts, countsOK := finalStatus.Data["counts"].(Counts)
 	manual = findResource(finalPools, "manual-01")
-	if finalStatus.Code != "" || !poolsOK || !countsOK || finalCounts.AuditRows != beforeMaxCounts.AuditRows || manual == nil || manual.State != "available" || manual.FencingToken != int64(^uint64(0)>>1) {
+	if finalStatus.Code != "" || !poolsOK || !countsOK || finalCounts.AuditRows != beforeMaxCounts.AuditRows+1 || manual == nil || manual.State != "disabled" || manual.FencingToken != int64(^uint64(0)>>1) {
 		t.Fatalf("resource after MAX_INT64 enable refusal = %#v, status=%#v", manual, finalStatus)
+	}
+	maxAudit, err := server.store.db.Query("SELECT operation,result_code,from_state,to_state FROM audit WHERE target_id=? ORDER BY sequence DESC LIMIT 1", "manual-01")
+	if err != nil || len(maxAudit) != 1 || rowString(maxAudit[0], "operation") != "scheduler" || rowString(maxAudit[0], "result_code") != "ok" || rowString(maxAudit[0], "from_state") != "available" || rowString(maxAudit[0], "to_state") != "disabled" {
+		t.Fatalf("MAX_INT64 pre-refusal audit = %#v, want only the scheduler transition from available to disabled", maxAudit)
 	}
 }
 

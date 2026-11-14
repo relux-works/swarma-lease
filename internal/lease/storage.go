@@ -24,6 +24,7 @@ var (
 type Store struct {
 	db       *sqlite.DB
 	ownerUID int64
+	notifier *changeNotifier
 }
 
 func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
@@ -56,7 +57,7 @@ func openStore(stateDir string, ownerUID int64, sample Sample) (*Store, error) {
 		_ = db.Close()
 		return nil, errStorage
 	}
-	store := &Store{db: db, ownerUID: ownerUID}
+	store := &Store{db: db, ownerUID: ownerUID, notifier: newChangeNotifier()}
 	if err := validateDatabase(db, ownerUID); err != nil {
 		_ = db.Close()
 		return nil, err

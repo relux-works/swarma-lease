@@ -215,9 +215,6 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 			return invalid("invalid_wait_timeout", true)
 		}
 		input.RequestID = requestID
-		if input.WaitMode == "wait" {
-			return invalid("invalid_wait_mode", true)
-		}
 		sample, err := s.clock.Read()
 		if err != nil {
 			return invalid("clock_unavailable", true)
@@ -326,21 +323,16 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if len(data) != 0 {
 			return invalid("invalid_request", true)
 		}
-		state, result, code := s.store.Status(requestID, "")
-		if code != "" {
-			return "error", result, code, responseID, false
+		sample, err := s.clock.Read()
+		if err != nil {
+			return invalid("clock_unavailable", true)
 		}
-		request := result["request"].(*RequestRecord)
-		if state == "leased" {
-			if op == "lease.cancel" {
-				return "error", result, "request_not_cancellable", responseID, false
-			}
-			return "granted", result, "", responseID, false
+		if op == "lease.wait" {
+			state, result, code := s.store.Wait(requestID, sample)
+			return state, result, code, responseID, false
 		}
-		if request.State == "refused" && request.OutcomeCode != nil {
-			return "error", result, *request.OutcomeCode, responseID, false
-		}
-		return "error", result, "request_not_cancellable", responseID, false
+		state, result, code := s.store.Cancel(requestID, sample)
+		return state, result, code, responseID, false
 	case "lease.status":
 		return invalid("invalid_request", false)
 	default:

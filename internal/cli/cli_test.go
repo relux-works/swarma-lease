@@ -309,3 +309,19 @@ func TestSocketPathTooLongHasStableCLIResult(t *testing.T) {
 		t.Fatalf("socket path error result = %#v, want stable code without request ID", got)
 	}
 }
+
+// TestWaitAndCancelCLICommandsCarryOnlyTheRequestKey proves the blocking observer and cancellation commands use the existing idempotency key without accepting replacement acquisition input.
+func TestWaitAndCancelCLICommandsCarryOnlyTheRequestKey(t *testing.T) {
+	for _, command := range []string{"wait", "cancel"} {
+		request, err := buildRequest([]string{"lease", command, "--request-id", "req-01", "--json"})
+		if err != nil || request.Op != "lease."+command || request.RequestID != "req-01" || len(request.Data.(map[string]any)) != 0 {
+			t.Fatalf("lease %s request = (%#v, %v), want only key req-01", command, request, err)
+		}
+		if _, err := buildRequest([]string{"lease", command, "--request-id", "bad key", "--json"}); err == nil || err.code != "invalid_request_id" {
+			t.Fatalf("lease %s malformed key error = %v, want invalid_request_id", command, err)
+		}
+	}
+	if got := exitStatus("client_interrupted"); got != 130 {
+		t.Fatalf("client_interrupted exit = %d, want 130", got)
+	}
+}
