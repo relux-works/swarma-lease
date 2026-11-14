@@ -1,0 +1,42 @@
+name: Go CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go checks (${{ matrix.os }})
+    env:
+      CGO_ENABLED: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l cmd internal)"
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run race-enabled tests
+        run: go test -race -count=1 ./...
