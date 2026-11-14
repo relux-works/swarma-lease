@@ -65,7 +65,7 @@ func TestExchangeWaitsForTheTerminalEvent(t *testing.T) {
 func TestExchangeDistinguishesTransportFailures(t *testing.T) {
 	missing := filepath.Join(shortTestDir(t), "missing.sock")
 	request := WireRequest{Version: 1, Type: "request", Op: "lease.acquire", RequestID: "req-01", Data: map[string]any{}}
-	if result, code := Exchange(missing, request); code != "daemon_unavailable" || result.Code != "daemon_unavailable" {
+	if result, code := Exchange(missing, request); code != "daemon_unavailable" || result.Code != "daemon_unavailable" || result.RequestID != request.RequestID {
 		t.Fatalf("pre-send failure = (%#v, %q), want daemon_unavailable", result, code)
 	}
 	listener, path := listenTestSocket(t)
@@ -79,7 +79,7 @@ func TestExchangeDistinguishesTransportFailures(t *testing.T) {
 		_ = readTestRequest(t, conn)
 		_ = conn.Close()
 	}()
-	if result, code := Exchange(path, request); code != "result_unknown" || result.Code != "result_unknown" {
+	if result, code := Exchange(path, request); code != "result_unknown" || result.Code != "result_unknown" || result.RequestID != request.RequestID {
 		t.Fatalf("post-send failure = (%#v, %q), want result_unknown", result, code)
 	}
 	<-serverDone

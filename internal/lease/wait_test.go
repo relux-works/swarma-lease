@@ -237,6 +237,53 @@ func TestExchangeWaitsForServiceGrant(t *testing.T) {
 	}
 }
 
+// TestExchangeUnknownAfterCommittedQueueRecoversByRequestID proves a real socket loss after queue commit reports result_unknown with the original key and restart status recovers the durable waiter without a lease.
+func TestExchangeUnknownAfterCommittedQueueRecoversByRequestID(t *testing.T) {
+	server := newTestServer(t)
+	addManualResource(t, server, "qa.pool", "qa-01")
+	_ = acquireNoWait(t, server, "holder", "qa.pool")
+	changed := server.store.changes()
+	request := WireRequest{Version: 1, Type: "request", Op: "lease.acquire", RequestID: "transport-unknown-recovery", Data: waitData("qa.pool", time.Minute)}
+	resultCh := make(chan struct {
+		response Response
+		code     string
+	}, 1)
+	go func() {
+		result, code := Exchange(server.socketPath, request)
+		resultCh <- struct {
+			response Response
+			code     string
+		}{result, code}
+	}()
+	select {
+	case <-changed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocking request did not commit its queue entry")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("stop service after queue commit: %v", err)
+	}
+	result := <-resultCh
+	if result.code != "result_unknown" || result.response.State != "error" || result.response.Code != "result_unknown" || result.response.RequestID != request.RequestID {
+		t.Fatalf("post-commit socket loss = (%#v, %q), want result_unknown with original key", result.response, result.code)
+	}
+
+	recovered, err := Start(Config{StateDir: server.stateDir, SocketPath: server.socketPath})
+	if err != nil {
+		t.Fatalf("restart service after observer loss: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Errorf("close recovered service: %v", err)
+		}
+	})
+	state, data, code := recovered.store.Status(request.RequestID, "")
+	queued, ok := data["request"].(*RequestRecord)
+	if code != "" || state != "queued" || !ok || queued == nil || queued.State != "queued" || queued.QueueSequence == nil || data["lease"] != nil || data["resource"] != nil || leaseCount(t, recovered, request.RequestID) != 0 {
+		t.Fatalf("status recovery = (%s, %#v, %q), want the same queued request without a lease", state, data, code)
+	}
+}
+
 // TestFIFOWaitsGrantOldestAndKeepTagsIndependent proves same-tag FIFO ordering and confirms that capacity on another tag remains available.
 func TestFIFOWaitsGrantOldestAndKeepTagsIndependent(t *testing.T) {
 	server := newTestServer(t)
@@ -364,7 +411,8 @@ func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
 		t.Fatalf("unknown-tag waiter = %#v, want immediate durable refusal without queue or lease", unknown)
 	}
 	tooLong := directRequest(t, server, "lease.acquire", "too-long", waitData("qa.pool", time.Duration(maxWaitNS)+time.Nanosecond))
-	if tooLong.Code != "wait_exceeds_max" || tooLong.Data["lease"] != nil || tooLong.Data["resource"] != nil {
+	tooLongRequest, hasRequest := tooLong.Data["request"].(*RequestRecord)
+	if tooLong.Code != "wait_exceeds_max" || !hasRequest || tooLongRequest == nil || tooLongRequest.State != "refused" || tooLongRequest.OutcomeCode == nil || *tooLongRequest.OutcomeCode != "wait_exceeds_max" || tooLongRequest.QueueSequence != nil || tooLong.Data["lease"] != nil || tooLong.Data["resource"] != nil || leaseCount(t, server, "too-long") != 0 {
 		t.Fatalf("over-limit waiter = %#v", tooLong)
 	}
 	boundary := directRequest(t, server, "lease.acquire", "boundary", waitData("qa.pool", time.Duration(maxWaitNS)))
