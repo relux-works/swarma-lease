@@ -16,7 +16,7 @@ import (
 	"github.com/relux-works/swarma-lease/internal/sqlite"
 )
 
-// TestStaleSocketUnlinkRefusalPreservesRecoveryState proves Darwin rejects direct unlink of an immutable stale socket and startup refuses before database mutation, preserving durable state and the original inode. The injected removal-failure test covers refusal after backup creation.
+// TestStaleSocketUnlinkRefusalPreservesRecoveryState proves Darwin rejects direct unlink of an immutable stale socket and startup refuses before database mutation, preserving durable state and the original inode. It holds an idle WAL writer open so read-only table snapshots can inspect the WAL; volatile SHM bytes are outside the invariant. The injected removal-failure test covers refusal after backup creation.
 func TestStaleSocketUnlinkRefusalPreservesRecoveryState(t *testing.T) {
 	root := shortTestDir(t)
 	stateDir := filepath.Join(root, "state")
@@ -32,6 +32,15 @@ func TestStaleSocketUnlinkRefusalPreservesRecoveryState(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close WAL fixture: %v", err)
 	}
+	db, err = sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen WAL fixture writer for read-only snapshots: %v", err)
+	}
+	if _, err := db.Query("SELECT singleton_id FROM settings"); err != nil {
+		_ = db.Close()
+		t.Fatalf("read WAL fixture to retain shared-memory coordination: %v", err)
+	}
+	defer db.Close()
 	socketPath := filepath.Join(stateDir, "service.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
