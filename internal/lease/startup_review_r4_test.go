@@ -75,8 +75,8 @@ func TestLateSocketParentRefusalPreservesRecoveryState(t *testing.T) {
 	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" {
 		t.Fatalf("valid recovery control = %s/%s/%#v, want one active grant", state, code, result)
 	}
-	if audits := hardEndAuditCount(t, recovered); audits != 9 {
-		t.Fatalf("valid recovery control audit rows = %d, want 9", audits)
+	if audits := hardEndAuditCount(t, recovered); audits != 10 {
+		t.Fatalf("valid recovery control audit rows = %d, want 10", audits)
 	}
 }
 
@@ -108,7 +108,7 @@ func TestInvalidDatabasePreservesProvenStaleSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open fixture database: %v", err)
 	}
-	if err := db.ExecScript("PRAGMA user_version=2;"); err != nil {
+	if err := db.ExecScript("PRAGMA user_version=3;"); err != nil {
 		_ = db.Close()
 		t.Fatalf("set incompatible fixture version: %v", err)
 	}

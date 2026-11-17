@@ -150,8 +150,8 @@ func TestStartupSocketRefusalsPreserveOverdueRecoveryState(t *testing.T) {
 			if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" {
 				t.Fatalf("recovered queued request = %s/%s/%#v, want one active grant", state, code, result)
 			}
-			if audits := hardEndAuditCount(t, recovered); audits != 9 {
-				t.Fatalf("successful recovery audit rows = %d, want three original rows plus three expiry and three grant rows", audits)
+			if audits := hardEndAuditCount(t, recovered); audits != 10 {
+				t.Fatalf("successful recovery audit rows = %d, want four original rows plus three expiry and three grant rows", audits)
 			}
 		})
 	}

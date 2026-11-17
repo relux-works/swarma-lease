@@ -329,6 +329,20 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 			state = "error"
 		}
 		return state, result, code, "", false
+	case "queue.status":
+		if !onlyKeys(data, "tag") || len(data) != 1 {
+			return invalid("invalid_request", false)
+		}
+		tag, validType := jsonStringValue(data["tag"])
+		if !validType || !tagIDPattern.MatchString(tag) {
+			return invalid("invalid_request", false)
+		}
+		result, code := s.store.QueueStatus(tag)
+		state := "ok"
+		if code != "" {
+			state = "error"
+		}
+		return state, result, code, "", false
 	case "audit.list":
 		if !hasOnlyRequiredOptional(data, []string{"limit"}, []string{"before_sequence"}) {
 			return invalid("invalid_request", false)
@@ -373,7 +387,7 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 
 func knownOperation(op string) bool {
 	switch op {
-	case "lease.acquire", "lease.wait", "lease.cancel", "lease.release", "lease.status", "resource.add", "resource.disable", "resource.enable", "resource.recover", "service.status", "audit.list":
+	case "lease.acquire", "lease.wait", "lease.cancel", "lease.release", "lease.status", "resource.add", "resource.disable", "resource.enable", "resource.recover", "service.status", "queue.status", "audit.list":
 		return true
 	default:
 		return false

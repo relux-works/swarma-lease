@@ -18,6 +18,7 @@ import (
 )
 
 type result struct {
+	Op        string         `json:"op"`
 	State     string         `json:"state"`
 	Code      string         `json:"code"`
 	RequestID string         `json:"request_id"`
@@ -375,7 +376,7 @@ func TestLocalFlagErrorsKeepOnlyKnownRequestKeys(t *testing.T) {
 func TestDefaultCommandPoolsRemainClosed(t *testing.T) {
 	_, socket := startFixture(t)
 	code, before := runJSON(t, socket, "service", "status", "--json")
-	if code != 0 || before.Data["max_lease_duration_ns"] != float64(20*60*1_000_000_000) || before.Data["max_wait_timeout_ns"] != float64(30*60*1_000_000_000) {
+	if code != 0 || before.Data["max_lease_duration_ns"] != float64(20*60*1_000_000_000) || before.Data["max_wait_timeout_ns"] != float64(4*60*60*1_000_000_000) {
 		t.Fatalf("initial service status = (%d, %#v), want fixed default limits", code, before)
 	}
 	pools, ok := before.Data["pools"].([]any)
@@ -737,5 +738,35 @@ func TestStableRefusalExitCodeTable(t *testing.T) {
 				t.Fatalf("exit status for %s = %d, want %d", tc.code, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestQueueStatusCLIUsesTheNativeOperation proves queue status emits the exact queue.status request and a bounded successful response, while malformed local forms refuse before transport.
+func TestQueueStatusCLIUsesTheNativeOperation(t *testing.T) {
+	_, socket := startFixture(t)
+	request, err := buildRequest([]string{"queue", "status", "--tag", "qa.missing", "--json"})
+	if err != nil || request.Op != "queue.status" || !reflect.DeepEqual(request.Data, map[string]any{"tag": "qa.missing"}) {
+		t.Fatalf("queue status request = %#v, %v; want native queue.status with only tag", request, err)
+	}
+	code, got := runJSON(t, socket, "queue", "status", "--tag", "qa.missing", "--json")
+	if code != 0 || got.Op != "queue.status" || got.State != "ok" || got.Code != "" || len(got.Data) != 3 || got.Data["tag"] != "qa.missing" || got.Data["queued_count"] != float64(0) || got.Data["oldest_queued_at"] != nil {
+		t.Fatalf("queue status response = (%d,%#v), want exact empty summary", code, got)
+	}
+	for key := range got.Data {
+		if key != "tag" && key != "queued_count" && key != "oldest_queued_at" {
+			t.Fatalf("queue status exposed unexpected field %q", key)
+		}
+	}
+
+	for _, args := range [][]string{
+		{"queue", "status", "--json"},
+		{"queue", "status", "--tag", "bad/tag", "--json"},
+		{"queue", "status", "--tag", "qa.first", "--tag", "qa.second", "--json"},
+		{"queue", "status", "--tag", "qa.valid"},
+	} {
+		code, rejected := runJSON(t, socket, args...)
+		if code != 2 || rejected.Op != "queue.status" || rejected.State != "error" || rejected.Code != "invalid_request" || len(rejected.Data) != 0 {
+			t.Fatalf("queue status CLI %v = (%d,%#v), want local invalid_request", args, code, rejected)
+		}
 	}
 }

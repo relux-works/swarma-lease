@@ -6,9 +6,11 @@ import (
 )
 
 const (
-	maxLeaseNS = int64(20 * time.Minute)
-	maxWaitNS  = int64(30 * time.Minute)
-	dateLayout = "2006-01-02T15:04:05.000000000Z"
+	maxLeaseNS        = int64(20 * time.Minute)
+	maxWaitNS         = int64(4 * time.Hour)
+	schemaVersion     = int64(2)
+	schemaV1MaxWaitNS = int64(30 * time.Minute)
+	dateLayout        = "2006-01-02T15:04:05.000000000Z"
 )
 
 type Config struct {

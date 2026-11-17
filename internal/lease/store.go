@@ -31,31 +31,24 @@ func (s *Store) withClockTransaction(fn func(*sqlite.Tx, Sample) error) error {
 	})
 }
 
-func (s *Store) recoverBoot() error {
-	var events []TerminalEvent
-	err := s.withClockTransaction(func(tx *sqlite.Tx, sample Sample) error {
-		rows, err := tx.Query("SELECT boot_session_id FROM settings WHERE singleton_id=1")
-		if err != nil || len(rows) != 1 {
-			return sqlite.ErrStorage
-		}
-		oldBoot := rowString(rows[0], "boot_session_id")
-		if err := s.applyDue(tx, sample, "startup.recovery", &events); err != nil {
-			return err
-		}
-		if oldBoot != sample.BootSessionID {
-			if _, err := tx.Exec("UPDATE settings SET boot_session_id=? WHERE singleton_id=1", sample.BootSessionID); err != nil {
-				return err
-			}
-		}
-		if err := disableAllExhaustedResources(tx, sample); err != nil {
-			return err
-		}
-		return s.scheduleQueued(tx, sample, &events)
-	})
-	if err == nil {
-		s.publishEvents(events)
+func (s *Store) recoverBootTx(tx *sqlite.Tx, sample Sample, events *[]TerminalEvent) error {
+	rows, err := tx.Query("SELECT boot_session_id FROM settings WHERE singleton_id=1")
+	if err != nil || len(rows) != 1 {
+		return sqlite.ErrStorage
 	}
-	return err
+	oldBoot := rowString(rows[0], "boot_session_id")
+	if err := s.applyDue(tx, sample, "startup.recovery", events); err != nil {
+		return err
+	}
+	if oldBoot != sample.BootSessionID {
+		if _, err := tx.Exec("UPDATE settings SET boot_session_id=? WHERE singleton_id=1", sample.BootSessionID); err != nil {
+			return err
+		}
+	}
+	if err := disableAllExhaustedResources(tx, sample); err != nil {
+		return err
+	}
+	return s.scheduleQueued(tx, sample, events)
 }
 
 func (s *Store) Acquire(in AcquireInput) (string, map[string]any, string) {
@@ -410,6 +403,63 @@ func (s *Store) Status(requestID, leaseID string) (string, map[string]any, strin
 		return "error", emptyData(), code
 	}
 	return state, result, ""
+}
+
+func (s *Store) QueueStatus(tag string) (map[string]any, string) {
+	var data map[string]any
+	err := s.db.View(func(tx *sqlite.Tx) error {
+		settings, err := tx.Query("SELECT boot_session_id FROM settings WHERE singleton_id=1")
+		if err != nil || len(settings) != 1 {
+			return sqlite.ErrStorage
+		}
+		sample, err := readClockSample(s.clock)
+		if err != nil {
+			return err
+		}
+		bootID := rowString(settings[0], "boot_session_id")
+		if !validUUID(bootID) || bootID != sample.BootSessionID {
+			return errCorrupt
+		}
+		rows, err := tx.Query(`SELECT queue_sequence,queued_at,wait_timeout_ns,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns
+FROM requests WHERE tag=? AND state='queued'`, tag)
+		if err != nil {
+			return err
+		}
+		var count int64
+		oldest := ""
+		for _, row := range rows {
+			sequence := nullableInt(row, "queue_sequence")
+			queuedAt := nullableString(row, "queued_at")
+			waitTimeout := nullableInt(row, "wait_timeout_ns")
+			queueBootID := nullableString(row, "queue_boot_session_id")
+			started := nullableInt(row, "queue_started_monotonic_ns")
+			deadline := nullableInt(row, "wait_deadline_monotonic_ns")
+			if sequence == nil || *sequence < 1 || queuedAt == nil || waitTimeout == nil || *waitTimeout <= 0 || *waitTimeout > maxWaitNS || queueBootID == nil || !validUUID(*queueBootID) || *queueBootID != bootID || started == nil || *started < 0 || *started > sample.MonotonicNS || deadline == nil || *deadline <= *started || *deadline-*started != *waitTimeout {
+				return errCorrupt
+			}
+			parsedAt, err := time.Parse(dateLayout, *queuedAt)
+			if err != nil || parsedAt.UTC().Format(dateLayout) != *queuedAt {
+				return errCorrupt
+			}
+			if *deadline <= sample.MonotonicNS {
+				continue
+			}
+			count++
+			if oldest == "" || *queuedAt < oldest {
+				oldest = *queuedAt
+			}
+		}
+		var oldestAt any
+		if count > 0 {
+			oldestAt = oldest
+		}
+		data = map[string]any{"tag": tag, "queued_count": count, "oldest_queued_at": oldestAt}
+		return nil
+	})
+	if err != nil {
+		return emptyData(), storageCode(err)
+	}
+	return data, ""
 }
 
 func (s *Store) ServiceStatus() (map[string]any, string) {

@@ -65,12 +65,13 @@ func openStore(stateDir string, ownerUID int64, clock Clock) (*Store, error) {
 		return nil, errStorage
 	}
 	store := &Store{db: db, ownerUID: ownerUID, clock: clock, notifier: newChangeNotifier()}
-	if err := validateDatabase(db, ownerUID); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if !createdDatabase {
-		if err := store.recoverBoot(); err != nil {
+	if createdDatabase {
+		if err := validateDatabase(db, ownerUID); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	} else {
+		if err := store.migrateAndRecover(); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
@@ -163,7 +164,7 @@ func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, clock Clock) 
 		if err := tx.ExecScript(schemaSQL); err != nil {
 			return err
 		}
-		_, err = tx.Exec("INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,1,?,?,?,?,?)", ownerUID, maxLeaseNS, maxWaitNS, sample.BootSessionID, timestamp(sample.Wall))
+		_, err = tx.Exec("INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,?,?,?,?,?,?)", schemaVersion, ownerUID, maxLeaseNS, maxWaitNS, sample.BootSessionID, timestamp(sample.Wall))
 		if err != nil {
 			return err
 		}
@@ -208,13 +209,76 @@ func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, clock Clock) 
 	return syncDirectory(stateDir)
 }
 
-func validateDatabase(db *sqlite.DB, ownerUID int64) error {
+type databaseQueryer interface {
+	Query(string, ...any) ([]sqlite.Row, error)
+}
+
+func migrateDatabase(tx *sqlite.Tx, ownerUID int64) error {
+	rows, err := tx.Query("PRAGMA user_version")
+	if err != nil || len(rows) != 1 {
+		return errIncompatible
+	}
+	version := rowInt(rows[0], "user_version")
+	switch version {
+	case schemaVersion:
+		return validateDatabaseVersion(tx, ownerUID, schemaVersion)
+	case 1:
+		if err := validateDatabaseVersion(tx, ownerUID, 1); err != nil {
+			return err
+		}
+	default:
+		return errIncompatible
+	}
+
+	if err := tx.ExecScript("ALTER TABLE settings RENAME TO settings_v1;\n" + settingsV2SQL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at)
+SELECT singleton_id,?,owner_uid,max_lease_ns,?,boot_session_id,created_at FROM settings_v1`, schemaVersion, maxWaitNS); err != nil {
+		return err
+	}
+	if err := tx.ExecScript("DROP TABLE settings_v1;\nPRAGMA user_version=2;"); err != nil {
+		return err
+	}
+	return validateDatabaseVersion(tx, ownerUID, schemaVersion)
+}
+
+func (s *Store) migrateAndRecover() error {
+	if s.beforeClockTransactionForTest != nil {
+		s.beforeClockTransactionForTest()
+	}
+	var events []TerminalEvent
+	err := s.db.Transaction(func(tx *sqlite.Tx) error {
+		if err := migrateDatabase(tx, s.ownerUID); err != nil {
+			return err
+		}
+		sample, err := readClockSample(s.clock)
+		if err != nil {
+			return err
+		}
+		return s.recoverBootTx(tx, sample, &events)
+	})
+	if err == nil {
+		s.publishEvents(events)
+	}
+	return err
+}
+
+func validateDatabase(db databaseQueryer, ownerUID int64) error {
+	rows, err := db.Query("PRAGMA user_version")
+	if err != nil || len(rows) != 1 {
+		return errIncompatible
+	}
+	return validateDatabaseVersion(db, ownerUID, rowInt(rows[0], "user_version"))
+}
+
+func validateDatabaseVersion(db databaseQueryer, ownerUID, version int64) error {
 	rows, err := db.Query("PRAGMA integrity_check")
 	if err != nil || len(rows) != 1 || rowString(rows[0], "integrity_check") != "ok" {
 		return errCorrupt
 	}
 	rows, err = db.Query("PRAGMA user_version")
-	if err != nil || len(rows) != 1 || rowInt(rows[0], "user_version") != 1 {
+	if err != nil || len(rows) != 1 || rowInt(rows[0], "user_version") != version || (version != 1 && version != schemaVersion) {
 		return errIncompatible
 	}
 	expected := map[string][]string{
@@ -245,7 +309,7 @@ func validateDatabase(db *sqlite.DB, ownerUID int64) error {
 		"table:requests": true, "table:resources": true, "table:settings": true,
 		"index:leases_one_active_resource": true, "index:requests_tag_queue_sequence": true,
 	}
-	wantDefinitions := expectedSchemaDefinitions()
+	wantDefinitions := expectedSchemaDefinitionsFor(version)
 	if len(objects) != len(wantObjects) || len(wantDefinitions) != len(wantObjects) {
 		return errIncompatible
 	}
@@ -259,7 +323,11 @@ func validateDatabase(db *sqlite.DB, ownerUID int64) error {
 	if err != nil || len(settings) != 1 {
 		return errIncompatible
 	}
-	if rowInt(settings[0], "schema_version") != 1 || rowInt(settings[0], "owner_uid") != ownerUID || rowInt(settings[0], "max_lease_ns") != maxLeaseNS || rowInt(settings[0], "max_wait_ns") != maxWaitNS {
+	wantMaxWaitNS := maxWaitNS
+	if version == 1 {
+		wantMaxWaitNS = schemaV1MaxWaitNS
+	}
+	if rowInt(settings[0], "schema_version") != version || rowInt(settings[0], "owner_uid") != ownerUID || rowInt(settings[0], "max_lease_ns") != maxLeaseNS || rowInt(settings[0], "max_wait_ns") != wantMaxWaitNS {
 		return errUnsafePath
 	}
 	bootSessionID := rowString(settings[0], "boot_session_id")
@@ -276,7 +344,7 @@ func validateDatabase(db *sqlite.DB, ownerUID int64) error {
 	return nil
 }
 
-func validateLiveEpochs(db *sqlite.DB, settingsBootID string) error {
+func validateLiveEpochs(db databaseQueryer, settingsBootID string) error {
 	leases, err := db.Query("SELECT boot_session_id FROM leases WHERE state='active'")
 	if err != nil {
 		return errCorrupt
@@ -319,6 +387,14 @@ func expectedSchemaDefinitions() map[string]string {
 			continue
 		}
 		definitions[key] = normalizeSchemaSQL(statement)
+	}
+	return definitions
+}
+
+func expectedSchemaDefinitionsFor(version int64) map[string]string {
+	definitions := expectedSchemaDefinitions()
+	if version == 1 {
+		definitions["table:settings"] = normalizeSchemaSQL(strings.TrimSuffix(settingsV1SQL, ";"))
 	}
 	return definitions
 }

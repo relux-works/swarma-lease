@@ -115,7 +115,7 @@ func TestStaleSocketUnlinkRefusalPreservesRecoveryState(t *testing.T) {
 	state, data, code := recovered.store.Status("fixture-queued", "")
 	request, requestOK := data["request"].(*RequestRecord)
 	lease, leaseOK := data["lease"].(LeaseRecord)
-	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 9 {
+	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 10 {
 		t.Fatalf("valid startup control = %s/%s/%#v, want one active waiter grant and 9 audits", state, code, data)
 	}
 	assertNoStaleSocketBackup(t, stateDir)
@@ -213,7 +213,7 @@ func TestStaleSocketRemovalFailurePreservesRecoveryState(t *testing.T) {
 	state, data, code := recovered.store.Status("fixture-queued", "")
 	request, requestOK := data["request"].(*RequestRecord)
 	lease, leaseOK := data["lease"].(LeaseRecord)
-	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 9 {
+	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 10 {
 		t.Fatalf("valid removal control = %s/%s/%#v, want one active waiter grant and 9 audits", state, code, data)
 	}
 	assertNoStaleSocketBackup(t, stateDir)
@@ -299,7 +299,7 @@ func TestWritableRecoveryRefusalRestoresOriginalStaleSocket(t *testing.T) {
 	state, data, code := recovered.store.Status("fixture-queued", "")
 	request, requestOK := data["request"].(*RequestRecord)
 	lease, leaseOK := data["lease"].(LeaseRecord)
-	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 9 {
+	if code != "" || state != "leased" || !requestOK || request.State != "leased" || !leaseOK || lease.State != "active" || hardEndAuditCount(t, recovered) != 10 {
 		t.Fatalf("valid writable-recovery control = %s/%s/%#v, want one active waiter grant and 9 audits", state, code, data)
 	}
 	newInfo, err := os.Lstat(socketPath)

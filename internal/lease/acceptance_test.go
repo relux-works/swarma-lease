@@ -13,8 +13,8 @@ import (
 	"github.com/relux-works/swarma-lease/internal/sqlite"
 )
 
-// TestCanonicalDatabaseFixtureSurvivesRestart proves an independently authored v1 database keeps its active lease, FIFO deadline, counter, and audit history, while a later resource addition persists across another restart.
-func TestCanonicalDatabaseFixtureSurvivesRestart(t *testing.T) {
+// TestCanonicalV1DatabaseMigratesAndSurvivesRestart proves an independently authored v1 database upgrades atomically while retaining its resources, active and queued and terminal requests, FIFO deadline and sequence, and audit history.
+func TestCanonicalV1DatabaseMigratesAndSurvivesRestart(t *testing.T) {
 	root := shortTestDir(t)
 	stateDir := filepath.Join(root, "state")
 	writeCanonicalV1Fixture(t, stateDir, int64(os.Geteuid()))
@@ -23,6 +23,14 @@ func TestCanonicalDatabaseFixtureSurvivesRestart(t *testing.T) {
 	server, err := Start(config)
 	if err != nil {
 		t.Fatalf("start from independent canonical database: %v", err)
+	}
+	versionRows, err := server.store.db.Query("PRAGMA user_version")
+	if err != nil || len(versionRows) != 1 || rowInt(versionRows[0], "user_version") != schemaVersion {
+		t.Fatalf("migrated user_version = %#v, %v; want %d", versionRows, err, schemaVersion)
+	}
+	serviceData, serviceCode := server.store.ServiceStatus()
+	if serviceCode != "" || serviceData["schema_version"] != schemaVersion || serviceData["max_wait_timeout_ns"] != maxWaitNS {
+		t.Fatalf("migrated service limits = %#v/%s, want schema %d and max wait %d", serviceData, serviceCode, schemaVersion, maxWaitNS)
 	}
 
 	activeState, active, code := server.store.Status("fixture-active", "")
@@ -37,6 +45,19 @@ func TestCanonicalDatabaseFixtureSurvivesRestart(t *testing.T) {
 	queuedRequest, requestOK := queued["request"].(*RequestRecord)
 	if code != "" || queuedState != "queued" || !requestOK || queuedRequest.QueueSequence == nil || *queuedRequest.QueueSequence != 7 {
 		t.Fatalf("fixture queued request = %s/%#v/%s, want original sequence seven", queuedState, queued["request"], code)
+	}
+	terminalState, terminal, code := server.store.Status("fixture-terminal", "")
+	terminalRequest, terminalOK := terminal["request"].(*RequestRecord)
+	if code != "" || terminalState != "timed_out" || !terminalOK || stringValue(terminalRequest.OutcomeCode) != "request_timed_out" {
+		t.Fatalf("fixture terminal request = %s/%#v/%s, want original timed-out outcome", terminalState, terminal["request"], code)
+	}
+	sequenceRows, err := server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag='qa.fixture'")
+	if err != nil || len(sequenceRows) != 1 || rowInt(sequenceRows[0], "next_queue_sequence") != 8 {
+		t.Fatalf("migrated queue counter = %#v, %v; want 8", sequenceRows, err)
+	}
+	initialAuditRows, err := server.store.db.Query("SELECT COUNT(*) AS n FROM audit")
+	if err != nil || len(initialAuditRows) != 1 || rowInt(initialAuditRows[0], "n") != 4 {
+		t.Fatalf("migrated audit history = %#v, %v; want four preserved rows", initialAuditRows, err)
 	}
 	_, _, code = server.store.AddResource("qa.persistence", "persisted-01", "manual")
 	if code != "" {
@@ -61,8 +82,8 @@ func TestCanonicalDatabaseFixtureSurvivesRestart(t *testing.T) {
 		t.Fatalf("resource.add did not survive restart: pools=%#v code=%s", resources["pools"], code)
 	}
 	rows, err := restarted.store.db.Query("SELECT COUNT(*) AS count FROM audit")
-	if err != nil || len(rows) != 1 || rowInt(rows[0], "count") != 4 {
-		t.Fatalf("fixture and persistence-control audit rows = %#v, %v; want four", rows, err)
+	if err != nil || len(rows) != 1 || rowInt(rows[0], "count") != 5 {
+		t.Fatalf("fixture and persistence-control audit rows = %#v, %v; want five", rows, err)
 	}
 }
 
@@ -71,7 +92,8 @@ func TestInvalidCanonicalDatabasesArePreserved(t *testing.T) {
 	for _, tc := range []struct {
 		name, mutation, want string
 	}{
-		{"wrong-user-version", "PRAGMA user_version=2;", "state_incompatible"},
+		{"unknown-user-version", "PRAGMA user_version=3;", "state_incompatible"},
+		{"schema-version-mismatch", "PRAGMA user_version=2;", "state_incompatible"},
 		{"missing-index", "DROP INDEX requests_tag_queue_sequence;", "state_incompatible"},
 		{"extra-object", "CREATE TABLE unexpected(value INTEGER);", "state_incompatible"},
 		{"integrity-check", "PRAGMA ignore_check_constraints=ON; UPDATE pools SET next_queue_sequence=0 WHERE tag='qa.fixture'; PRAGMA ignore_check_constraints=OFF;", "state_corrupt"},
@@ -568,7 +590,7 @@ func writeCanonicalV1Fixture(t *testing.T, stateDir string, ownerUID int64) stri
 		query string
 		args  []any
 	}{
-		{"INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,1,?,?,?,?,?)", []any{ownerUID, maxLeaseNS, maxWaitNS, bootID, at}},
+		{"INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) VALUES(1,1,?,?,?,?,?)", []any{ownerUID, maxLeaseNS, schemaV1MaxWaitNS, bootID, at}},
 		{"INSERT INTO pools(tag,mode,next_queue_sequence,created_at) VALUES(?,?,?,?)", []any{"mac.go-test", "command", int64(1), at}},
 		{"INSERT INTO pools(tag,mode,next_queue_sequence,created_at) VALUES(?,?,?,?)", []any{"mac.swift-test", "command", int64(1), at}},
 		{"INSERT INTO pools(tag,mode,next_queue_sequence,created_at) VALUES(?,?,?,?)", []any{"qa.fixture", "manual", int64(8), at}},
@@ -577,10 +599,12 @@ func writeCanonicalV1Fixture(t *testing.T, stateDir string, ownerUID int64) stri
 		{"INSERT INTO resources(id,tag,state,fencing_token,created_at,updated_at) VALUES(?,?, 'leased',5,?,?)", []any{"qa-fixture-01", "qa.fixture", at, at}},
 		{"INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?, 'no_wait',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'leased',NULL,?,?)", []any{"fixture-active", "qa.fixture", int64(10 * time.Second), at, at}},
 		{"INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?, 'wait',?,7,?,?,?, ?, ?, 'queued',NULL,?,?)", []any{"fixture-queued", "qa.fixture", int64(10 * time.Second), int64(20 * time.Second), at, waitDeadline, bootID, int64(time.Second), int64(21 * time.Second), at, at}},
+		{"INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?, 'wait',?,NULL,NULL,NULL,NULL,NULL,NULL,'timed_out','request_timed_out',?,?)", []any{"fixture-terminal", "qa.fixture", int64(10 * time.Second), int64(20 * time.Second), at, at}},
 		{"INSERT INTO leases(id,request_id,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token) VALUES(?,?,?,'active',?,?,?,?,?,?,?,NULL,NULL,NULL)", []any{"00000000000000000000000000000001", "fixture-active", "qa-fixture-01", int64(10 * time.Second), at, hardEnd, bootID, int64(time.Second), int64(11 * time.Second), int64(5)}},
 		{"INSERT INTO audit(sequence,at,operation,request_id,target_id,result_code,from_state,to_state) VALUES(1,?,'resource.add',NULL,?,'ok',NULL,'available')", []any{at, "qa-fixture-01"}},
 		{"INSERT INTO audit(sequence,at,operation,request_id,target_id,result_code,from_state,to_state) VALUES(2,?,'lease.acquire',?,?,'ok',NULL,'leased')", []any{at, "fixture-active", "fixture-active"}},
 		{"INSERT INTO audit(sequence,at,operation,request_id,target_id,result_code,from_state,to_state) VALUES(3,?,'lease.acquire',?,?,'ok',NULL,'queued')", []any{at, "fixture-queued", "fixture-queued"}},
+		{"INSERT INTO audit(sequence,at,operation,request_id,target_id,result_code,from_state,to_state) VALUES(4,?,'scheduler',?,?,'request_timed_out','queued','timed_out')", []any{at, "fixture-terminal", "fixture-terminal"}},
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement.query, statement.args...); err != nil {

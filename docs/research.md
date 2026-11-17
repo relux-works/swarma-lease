@@ -48,7 +48,7 @@ Implement the first slice in the [MVP contract](contract.md): a single-host Go s
 
 ## Open questions for the product owner
 
-First-host decisions are settled in the [MVP contract](contract.md): one `go-test-01` resource under `mac.go-test`, one `swift-test-01` resource under `mac.swift-test`, one configured macOS user, a 20-minute maximum lease, a 30-minute maximum queue wait, and no resource reuse until command/descendant stop and cleanup are confirmed.
+The initial first-host decision set a 30-minute maximum queue wait. The current [MVP contract](contract.md) accepts waits up to four hours while preserving existing 30-minute requests. The first host has one `go-test-01` resource under `mac.go-test`, one `swift-test-01` resource under `mac.swift-test`, one configured macOS user, a 20-minute maximum lease, and no resource reuse until command/descendant stop and cleanup are confirmed.
 
 - Which exact process-identity and descendant-stopping method should the later `lease run` contract use, including reparented descendants and cleanup failure recovery?
 - When multi-host support is scheduled, which central linearizable backend should own global allocation state and fencing tokens?

@@ -413,7 +413,7 @@ func TestLateObserverDoesNotDuplicateTerminalEvent(t *testing.T) {
 	}
 }
 
-// TestWaitTimeoutAndLimitPreserveLeaseState proves the exact 30-minute boundary is accepted, an over-limit wait is refused before queueing, and timeout creates no lease.
+// TestWaitTimeoutAndLimitPreserveLeaseState proves the exact four-hour boundary is accepted, an over-limit wait is refused before queueing, and timeout creates no lease.
 func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
 	server := newTestServer(t)
 	addManualResource(t, server, "qa.pool", "qa-01")
@@ -430,7 +430,7 @@ func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
 	}
 	boundary := directRequest(t, server, "lease.acquire", "boundary", waitData("qa.pool", time.Duration(maxWaitNS)))
 	if boundary.State != "queued" {
-		t.Fatalf("30-minute waiter = %#v, want queued", boundary)
+		t.Fatalf("four-hour waiter = %#v, want queued", boundary)
 	}
 	cancelled := directRequest(t, server, "lease.cancel", "boundary", map[string]any{})
 	if cancelled.State != "cancelled" {

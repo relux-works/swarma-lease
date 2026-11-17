@@ -124,6 +124,9 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	case args[0] == "service" && args[1] == "status":
 		request.Op, mode = "service.status", "no-fields"
 		boolFlags = []string{"--json"}
+	case args[0] == "queue" && args[1] == "status":
+		request.Op, mode = "queue.status", "queue-status"
+		valueFlags, boolFlags = []string{"--tag"}, []string{"--json"}
 	case args[0] == "history":
 		request.Op, mode = "audit.list", "history"
 		valueFlags, boolFlags = []string{"--limit", "--before-sequence"}, []string{"--json"}
@@ -257,6 +260,12 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 			}
 			data["before_sequence"] = parsed
 		}
+	case "queue-status":
+		tag := flags.values["--tag"]
+		if !validName(tag) {
+			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
+		}
+		data["tag"] = tag
 	}
 	request.Data = data
 	return request, nil

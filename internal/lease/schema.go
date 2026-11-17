@@ -1,12 +1,32 @@
 package lease
 
-const schemaSQL = `
-CREATE TABLE settings (
+const settingsV2SQL = `CREATE TABLE settings (
+  singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+  schema_version INTEGER NOT NULL CHECK(schema_version=2),
+  owner_uid INTEGER NOT NULL,
+  max_lease_ns INTEGER NOT NULL CHECK(max_lease_ns=1200000000000),
+  max_wait_ns INTEGER NOT NULL CHECK(max_wait_ns=14400000000000),
+  boot_session_id TEXT NOT NULL CHECK(length(boot_session_id)=36),
+  created_at TEXT NOT NULL
+);`
+
+const settingsV1SQL = `CREATE TABLE settings (
   singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
   schema_version INTEGER NOT NULL CHECK(schema_version=1),
   owner_uid INTEGER NOT NULL,
   max_lease_ns INTEGER NOT NULL CHECK(max_lease_ns=1200000000000),
   max_wait_ns INTEGER NOT NULL CHECK(max_wait_ns=1800000000000),
+  boot_session_id TEXT NOT NULL CHECK(length(boot_session_id)=36),
+  created_at TEXT NOT NULL
+);`
+
+const schemaSQL = `
+CREATE TABLE settings (
+  singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+  schema_version INTEGER NOT NULL CHECK(schema_version=2),
+  owner_uid INTEGER NOT NULL,
+  max_lease_ns INTEGER NOT NULL CHECK(max_lease_ns=1200000000000),
+  max_wait_ns INTEGER NOT NULL CHECK(max_wait_ns=14400000000000),
   boot_session_id TEXT NOT NULL CHECK(length(boot_session_id)=36),
   created_at TEXT NOT NULL
 );
@@ -73,5 +93,5 @@ CREATE TABLE audit (
   from_state TEXT,
   to_state TEXT
 );
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 `
