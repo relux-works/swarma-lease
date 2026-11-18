@@ -379,7 +379,7 @@ func writeCanonicalV2IdentityFixture(t *testing.T, stateDir string, ownerUID int
 		{"INSERT INTO resources(id,tag,state,fencing_token,created_at,updated_at) VALUES(?,?, 'leased',7,?,?)", []any{"go-resource", "mac.go-test-manual", at, at}},
 		{"INSERT INTO resources(id,tag,state,fencing_token,created_at,updated_at) VALUES(?,?, 'available',0,?,?)", []any{"jvm-resource", "mac.jvm-build", at, at}},
 		{"INSERT INTO resources(id,tag,state,fencing_token,created_at,updated_at) VALUES(?,?, 'available',0,?,?)", []any{"legacy-resource", "qa.legacy", at, at}},
-		v2RequestInsert("go-active", "mac.go-test-manual", "no_wait", nil, nil, nil, nil, nil, nil, "leased", nil, at),
+		v2RequestInsert("go-active", "mac.go-test-manual", "no_wait", nil, nil, nil, nil, nil, nil, nil, "leased", nil, at),
 		v2RequestInsert("go-queued-early", "mac.go-test-manual", "wait", ptrInt64(int64(20*time.Second)), ptrInt64(1), ptrString(at), ptrString("2026-11-14T00:00:20.000000000Z"), ptrString(bootID), ptrInt64(int64(time.Second)), ptrInt64(int64(21*time.Second)), "queued", nil, at),
 		v2RequestInsert("go-terminal", "mac.go-test-manual", "wait", ptrInt64(int64(20*time.Second)), ptrInt64(2), ptrString(at), ptrString("2026-11-14T00:00:20.000000000Z"), ptrString(bootID), ptrInt64(int64(time.Second)), ptrInt64(int64(21*time.Second)), "timed_out", ptrString("request_timed_out"), at),
 		v2RequestInsert("go-queued-late", "mac.go-test-manual", "wait", ptrInt64(int64(30*time.Second)), ptrInt64(3), ptrString("2026-11-14T00:00:02.000000000Z"), ptrString("2026-11-14T00:00:32.000000000Z"), ptrString(bootID), ptrInt64(int64(2*time.Second)), ptrInt64(int64(32*time.Second)), "queued", nil, at),

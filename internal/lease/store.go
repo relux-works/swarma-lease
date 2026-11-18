@@ -202,7 +202,6 @@ func (s *Store) refuse(tx *sqlite.Tx, in AcquireInput, sample Sample, refusal st
 	if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &in.RequestID, refusal, nil, stringPtr("refused")); err != nil {
 		return err
 	}
-	var err error
 	*data, err = requestResult(tx, in.RequestID)
 	if err != nil {
 		return err

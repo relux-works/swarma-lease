@@ -290,7 +290,6 @@ func TestResourceControlAndRecoveryTransitions(t *testing.T) {
 // TestResourceMutationsRequireAndAuditCaller proves missing callers cause no resource or audit writes for all four resource operations, while caller-backed positive controls preserve separate empty parents.
 func TestResourceMutationsRequireAndAuditCaller(t *testing.T) {
 	server := newTestServer(t)
-	uid := uint32(server.ownerUID)
 	auditCount := func() int64 {
 		t.Helper()
 		rows, err := server.store.db.Query("SELECT COUNT(*) AS n FROM audit")
