@@ -361,7 +361,8 @@ func (s *Store) enqueueRequest(tx *sqlite.Tx, in AcquireInput, sample Sample, st
 			return err
 		}
 	}
-	if _, err := tx.Exec("INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,class,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,class_queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,0,?,?,?,?,?,?,?, ?,?,?,?,?,?,'queued',NULL,?,?)", in.RequestID, in.RequesterID, in.Tag, nullableSQLString(class), in.DurationNS, in.WaitMode, *in.WaitTimeoutNS, sequence, classSequence, queuedAt, waitDeadlineAt, sample.BootSessionID, sample.MonotonicNS, deadline, queuedAt, queuedAt); err != nil {
+	if _, err := tx.Exec(`INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,class,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,class_queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at)
+VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?)`, in.RequestID, in.RequesterID, in.Tag, nullableSQLString(class), in.DurationNS, in.WaitMode, *in.WaitTimeoutNS, sequence, classSequence, queuedAt, waitDeadlineAt, sample.BootSessionID, sample.MonotonicNS, deadline, queuedAt, queuedAt); err != nil {
 		return err
 	}
 	if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &in.RequestID, "ok", nil, stringPtr("queued")); err != nil {

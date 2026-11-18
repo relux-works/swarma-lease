@@ -540,7 +540,7 @@ func exitStatus(code string) int {
 	switch code {
 	case "":
 		return 0
-	case "invalid_json", "frame_too_large", "unsupported_version", "unknown_operation", "invalid_request", "invalid_tag", "invalid_resource_id", "invalid_lease_id", "invalid_request_id", "invalid_duration", "invalid_wait_mode", "invalid_wait_timeout", "invalid_pool_mode":
+	case "invalid_json", "frame_too_large", "unsupported_version", "unknown_operation", "invalid_request", "invalid_tag", "invalid_resource_id", "invalid_lease_id", "invalid_request_id", "invalid_requester_id", "invalid_duration", "invalid_wait_mode", "invalid_wait_timeout", "invalid_pool_mode":
 		return 2
 	case "unknown_tag", "unknown_resource", "unknown_lease", "unknown_request":
 		return 3

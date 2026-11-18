@@ -287,7 +287,7 @@ func TestResourceControlAndRecoveryTransitions(t *testing.T) {
 	}
 }
 
-// TestResourceMutationsRequireAndAuditCaller proves missing callers cause no resource or audit writes for all four resource operations, while caller-backed positive controls preserve separate empty parents.
+// TestResourceMutationsRequireAndAuditCaller proves missing callers cause no resource or audit writes for all four resource operations, while caller-backed controls still work in separate valid manual and command pools.
 func TestResourceMutationsRequireAndAuditCaller(t *testing.T) {
 	server := newTestServer(t)
 	auditCount := func() int64 {
@@ -343,7 +343,7 @@ func TestResourceMutationsRequireAndAuditCaller(t *testing.T) {
 		t.Fatalf("caller-backed resource.enable = %#v, want enabled", got)
 	}
 
-	if got := directRequest(t, server, "resource.add", "", map[string]any{"tag": "qa.callers", "resource_id": "command-call", "mode": "command"}); got.State != "added" {
+	if got := directRequest(t, server, "resource.add", "", map[string]any{"tag": "qa.command-call", "resource_id": "command-call", "mode": "command"}); got.State != "added" {
 		t.Fatalf("caller-backed command resource.add = %#v, want added", got)
 	}
 	if _, err := server.store.db.Exec("UPDATE resources SET state='quarantined' WHERE id=?", "command-call"); err != nil {

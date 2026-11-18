@@ -132,7 +132,7 @@ VALUES(?, 'scheduler', 'caller', 'scheduler', 'promotion', 'request', 'bad-reque
 	}
 }
 
-// TestInvalidRequesterIDsHaveNoDurableEffects proves malformed, absent, and unprintable caller IDs refuse before request, lease, or audit writes while a valid resource-control fixture remains unchanged.
+// TestInvalidRequesterIDsHaveNoDurableEffects proves malformed caller IDs and invalid UTF-8 frames refuse before request, lease, or audit writes while a valid resource-control fixture remains unchanged.
 func TestInvalidRequesterIDsHaveNoDurableEffects(t *testing.T) {
 	server := newDirectTestServer(t)
 	addManualResource(t, server, "qa.identity", "identity-resource")
@@ -157,11 +157,24 @@ func TestInvalidRequesterIDsHaveNoDurableEffects(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			response, _ := server.handleBytes(tc.raw, uint32(server.ownerUID))
-			if response.State != "error" || response.Code != "invalid_requester_id" || response.RequestID == "" || len(response.Data) != 0 {
-				t.Fatalf("invalid identity response = %#v, want typed refusal with empty data", response)
+			wantCode := "invalid_requester_id"
+			if tc.name == "invalid-utf8" {
+				wantCode = "invalid_json"
 			}
-			if _, _, code := server.store.Status(response.RequestID, ""); code != "unknown_request" {
-				t.Fatalf("invalid identity reserved request %q: %s", response.RequestID, code)
+			if response.State != "error" || response.Code != wantCode || len(response.Data) != 0 {
+				t.Fatalf("invalid identity response = %#v, want %s with empty data", response, wantCode)
+			}
+			if tc.name == "invalid-utf8" {
+				if response.RequestID != "" {
+					t.Fatalf("malformed UTF-8 frame echoed request ID %q", response.RequestID)
+				}
+			} else {
+				if response.RequestID == "" {
+					t.Fatal("invalid requester ID omitted its valid request key")
+				}
+				if _, _, code := server.store.Status(response.RequestID, ""); code != "unknown_request" {
+					t.Fatalf("invalid identity reserved request %q: %s", response.RequestID, code)
+				}
 			}
 			if got := hardEndAuditCount(t, server); got != beforeAudit {
 				t.Fatalf("invalid identity wrote audit rows: before=%d after=%d", beforeAudit, got)

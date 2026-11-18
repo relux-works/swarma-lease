@@ -197,11 +197,12 @@ CREATE TABLE audit (
   from_state TEXT,
   to_state TEXT,
   CHECK((cause_ref_kind IS NULL AND cause_ref_id IS NULL) OR (cause_ref_kind IS NOT NULL AND cause_ref_id IS NOT NULL AND length(CAST(cause_ref_id AS BLOB)) BETWEEN 1 AND 128)),
-  CHECK(
+  CHECK(COALESCE(
     (actor_kind='caller' AND actor_component IS NULL AND cause IS NULL AND cause_ref_kind IS NULL AND cause_ref_id IS NULL AND ((legacy_unattributed=0 AND origin IS NULL AND requester_id IS NOT NULL AND length(CAST(requester_id AS BLOB)) BETWEEN 1 AND 128 AND (holder_id IS NULL OR length(CAST(holder_id AS BLOB)) BETWEEN 1 AND 128)) OR (legacy_unattributed=1 AND origin='pre_v3' AND requester_id IS NULL AND holder_id IS NULL)))
     OR (actor_kind='system' AND actor_component='scheduler' AND cause IS NOT NULL AND ((legacy_unattributed=0 AND origin IS NULL AND ((request_id IS NULL AND requester_id IS NULL AND holder_id IS NULL) OR (request_id IS NOT NULL AND requester_id IS NOT NULL AND length(CAST(requester_id AS BLOB)) BETWEEN 1 AND 128 AND (holder_id IS NULL OR length(CAST(holder_id AS BLOB)) BETWEEN 1 AND 128)))) OR (legacy_unattributed=1 AND origin='pre_v3' AND requester_id IS NULL AND holder_id IS NULL)))
-    OR (actor_kind='legacy' AND actor_component IS NULL AND cause IS NULL AND cause_ref_kind IS NULL AND cause_ref_id IS NULL AND legacy_unattributed=1 AND origin='pre_v3' AND requester_id IS NULL AND holder_id IS NULL)
-  )
+    OR (actor_kind='legacy' AND actor_component IS NULL AND cause IS NULL AND cause_ref_kind IS NULL AND cause_ref_id IS NULL AND legacy_unattributed=1 AND origin='pre_v3' AND requester_id IS NULL AND holder_id IS NULL),
+    0
+  ))
 );
 PRAGMA user_version=3;
 `

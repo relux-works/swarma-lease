@@ -948,16 +948,20 @@ func TestClassResourceAndQueueCommandsUseAllowlistedNativeFields(t *testing.T) {
 		t.Fatalf("empty queued class rows = %#v, want []", got.Data["queued_requests"])
 	}
 
-	for _, args := range [][]string{
-		{"queue", "status", "--class", "unknown", "--json"},
-		{"queue", "status", "--tag", "qa.pool", "--class", "go-test", "--json"},
-		{"queue", "status", "--json"},
-		{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-01", "--mode", "manual", "--class", "unknown", "--requester-id", "caller", "--json"},
-		{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-02", "--mode", "command", "--class", "go-test", "--requester-id", "caller", "--json"},
+	for _, tc := range []struct {
+		args []string
+		op   string
+	}{
+		{args: []string{"queue", "status", "--class", "unknown", "--json"}, op: "queue.status"},
+		{args: []string{"queue", "status", "--tag", "qa.pool", "--class", "go-test", "--json"}, op: "queue.status"},
+		{args: []string{"queue", "status", "--json"}, op: "queue.status"},
+		{args: []string{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-01", "--mode", "manual", "--class", "unknown", "--requester-id", "caller", "--json"}, op: "resource.add"},
+		{args: []string{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-02", "--mode", "command", "--class", "go-test", "--requester-id", "caller", "--json"}, op: "resource.add"},
 	} {
-		request, err := buildRequest(args)
-		if err == nil || request.Op == "" {
-			t.Errorf("malformed class CLI %v = %#v, %v; want local invalid_request", args, request, err)
+		request, err := buildRequest(tc.args)
+		commandErr, ok := err.(*commandError)
+		if !ok || commandErr.code != "invalid_request" || commandErr.op != tc.op || request.Op != "" {
+			t.Errorf("malformed class CLI %v = %#v, %v; want local %s invalid_request and no wire request", tc.args, request, err, tc.op)
 		}
 	}
 }
