@@ -46,6 +46,38 @@ func TestLaunchAgentDefinitionUsesStableAbsoluteBinary(t *testing.T) {
 	}
 }
 
+// TestRenderLaunchAgentBackgroundSessionLimitIsOptIn proves the product LaunchAgent omits the background-only domain limit while the isolated user-domain fixture can request it.
+func TestRenderLaunchAgentBackgroundSessionLimitIsOptIn(t *testing.T) {
+	definition := launchAgentDefinition{
+		Label:     launchAgentLabel,
+		Arguments: []string{"/Users/test/Library/Application Support/swarma-lease/bin/swarma-lease", "serve"},
+	}
+	defaultOutput, err := renderLaunchAgent(definition)
+	if err != nil {
+		t.Fatalf("render default LaunchAgent: %v", err)
+	}
+	if strings.Contains(string(defaultOutput), "LimitLoadToSessionType") {
+		t.Fatal("default LaunchAgent unexpectedly has a background-session limit")
+	}
+
+	definition.RequiresBackgroundSession = true
+	backgroundOutput, err := renderLaunchAgent(definition)
+	if err != nil {
+		t.Fatalf("render isolated Background-domain fixture: %v", err)
+	}
+	if !strings.Contains(string(backgroundOutput), "<key>LimitLoadToSessionType</key>\n    <string>Background</string>") {
+		t.Fatal("Background-domain fixture is missing its session limit")
+	}
+	decoder := xml.NewDecoder(strings.NewReader(string(backgroundOutput)))
+	for {
+		if _, err := decoder.Token(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("Background-domain plist is not well-formed XML: %v", err)
+		}
+	}
+}
+
 // TestLaunchAgentCommandUsesSystemAccountHome proves non-macOS refusal and Darwin use of account-record home instead of HOME.
 // The Darwin path check is limited to the current account.
 func TestLaunchAgentCommandUsesSystemAccountHome(t *testing.T) {

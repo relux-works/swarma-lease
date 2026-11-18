@@ -138,8 +138,9 @@ func TestLaunchAgentCrashRestartInIsolatedUserDomain(t *testing.T) {
 
 	countPath := filepath.Join(root, "starts")
 	definition := launchAgentDefinition{
-		Label:     label,
-		Arguments: []string{fixtureExecutable, "-test.run=^TestLaunchdServiceHelper$"},
+		Label:                     label,
+		Arguments:                 []string{fixtureExecutable, "-test.run=^TestLaunchdServiceHelper$"},
+		RequiresBackgroundSession: true,
 		Environment: map[string]string{
 			launchdTestChildEnv: "1",
 			launchdTestRootEnv:  root,

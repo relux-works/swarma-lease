@@ -22,9 +22,10 @@ var launchAgentTemplateFiles embed.FS
 const launchAgentLabel = "works.relux.swarma-lease"
 
 type launchAgentDefinition struct {
-	Label       string
-	Arguments   []string
-	Environment map[string]string
+	Label                     string
+	Arguments                 []string
+	Environment               map[string]string
+	RequiresBackgroundSession bool
 }
 
 func launchAgentDefinitionForHome(home string) launchAgentDefinition {
@@ -89,12 +90,17 @@ func renderLaunchAgent(definition launchAgentDefinition) ([]byte, error) {
 
 	plist := strings.Replace(string(templateBytes), "<string>__LABEL__</string>", "<string>"+label+"</string>", 1)
 	plist = strings.Replace(plist, "        <string>__PROGRAM_ARGUMENTS__</string>", strings.Join(arguments, "\n"), 1)
+	backgroundSessionLimit := ""
+	if definition.RequiresBackgroundSession {
+		backgroundSessionLimit = "    <key>LimitLoadToSessionType</key>\n    <string>Background</string>\n"
+	}
+	plist = strings.Replace(plist, "    __SESSION_TYPE_LIMIT__\n", backgroundSessionLimit, 1)
 	if environment.Len() == 0 {
 		plist = strings.Replace(plist, "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>__ENVIRONMENT_KEY__</key>\n        <string>__ENVIRONMENT_VALUE__</string>\n    </dict>\n", "", 1)
 	} else {
 		plist = strings.Replace(plist, "        <key>__ENVIRONMENT_KEY__</key>\n        <string>__ENVIRONMENT_VALUE__</string>", environment.String(), 1)
 	}
-	if strings.Contains(plist, "__LABEL__") || strings.Contains(plist, "__PROGRAM_ARGUMENTS__") || strings.Contains(plist, "__ENVIRONMENT_") {
+	if strings.Contains(plist, "__LABEL__") || strings.Contains(plist, "__PROGRAM_ARGUMENTS__") || strings.Contains(plist, "__ENVIRONMENT_") || strings.Contains(plist, "__SESSION_TYPE_LIMIT__") {
 		return nil, errors.New("launch agent template has an unreplaced placeholder")
 	}
 	return []byte(plist), nil
