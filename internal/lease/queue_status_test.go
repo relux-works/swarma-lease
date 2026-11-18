@@ -407,7 +407,7 @@ func TestQueueStatusInvalidInputsPreserveState(t *testing.T) {
 func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 	base := hardEndBaseSample()
 	clock := newControlledLeaseClock(base)
-	server, _ := startQueueStatusFixture(t, clock)
+	server, dbPath := startQueueStatusFixture(t, clock)
 	addQueueStatusResource(t, server, "qa.fifo", "fifo-01")
 	firstHolder := acquireQueueStatusHolder(t, server, "qa.fifo", "fifo-holder-01")
 	acquireQueueStatusWaiter(t, server, "qa.fifo", "fifo-waiter-01", int64(30*time.Minute))
@@ -448,7 +448,7 @@ func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 	}
 	clock.set(hardEndSampleAfter(base, 25*time.Minute, 25*time.Minute))
 	fourHourWait := maxWaitNS
-	state, _, code = server.store.Acquire(AcquireInput{RequestID: "fifo-waiter-02", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &fourHourWait})
+	state, _, code := server.store.Acquire(AcquireInput{RequestID: "fifo-waiter-02", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &fourHourWait})
 	if code != "" || state != "queued" {
 		t.Fatalf("same-key retry at 25 minutes = %s/%s, want existing queued request", state, code)
 	}
