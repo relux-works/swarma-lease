@@ -413,9 +413,11 @@ func TestLateObserverDoesNotDuplicateTerminalEvent(t *testing.T) {
 	}
 }
 
-// TestWaitTimeoutAndLimitPreserveLeaseState proves the exact four-hour boundary is accepted, an over-limit wait is refused before queueing, and timeout creates no lease.
-func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
-	server := newTestServer(t)
+// TestWaitLimitRefusalEffectsAndExactBoundary proves unknown-tag and over-limit refusals retain only their allowed durable rows, while the exact four-hour boundary remains queueable under a frozen clock.
+func TestWaitLimitRefusalEffectsAndExactBoundary(t *testing.T) {
+	base := hardEndBaseSample()
+	clock := newControlledLeaseClock(base)
+	server, dbPath := startQueueStatusFixture(t, clock)
 	addManualResource(t, server, "qa.pool", "qa-01")
 	holder := acquireNoWait(t, server, "holder", "qa.pool")
 	unknown := directRequest(t, server, "lease.acquire", "unknown-wait-tag", waitData("qa.missing", time.Minute))
@@ -423,11 +425,11 @@ func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
 	if unknown.Code != "unknown_tag" || unknownRequest.State != "refused" || unknownRequest.QueueSequence != nil || unknown.Data["lease"] != nil || unknown.Data["resource"] != nil {
 		t.Fatalf("unknown-tag waiter = %#v, want immediate durable refusal without queue or lease", unknown)
 	}
-	tooLong := directRequest(t, server, "lease.acquire", "too-long", waitData("qa.pool", time.Duration(maxWaitNS)+time.Nanosecond))
-	tooLongRequest, hasRequest := tooLong.Data["request"].(*RequestRecord)
-	if tooLong.Code != "wait_exceeds_max" || !hasRequest || tooLongRequest == nil || tooLongRequest.State != "refused" || tooLongRequest.OutcomeCode == nil || *tooLongRequest.OutcomeCode != "wait_exceeds_max" || tooLongRequest.QueueSequence != nil || tooLong.Data["lease"] != nil || tooLong.Data["resource"] != nil || leaseCount(t, server, "too-long") != 0 {
-		t.Fatalf("over-limit waiter = %#v", tooLong)
-	}
+	over := maxWaitNS + 1
+	assertOverCapRefusalEffects(t, server, dbPath, "too-long", "qa.pool", over, func() (string, map[string]any, string) {
+		response := directRequest(t, server, "lease.acquire", "too-long", waitData("qa.pool", time.Duration(over)))
+		return response.State, response.Data, response.Code
+	})
 	boundary := directRequest(t, server, "lease.acquire", "boundary", waitData("qa.pool", time.Duration(maxWaitNS)))
 	if boundary.State != "queued" {
 		t.Fatalf("four-hour waiter = %#v, want queued", boundary)
@@ -436,6 +438,19 @@ func TestWaitTimeoutAndLimitPreserveLeaseState(t *testing.T) {
 	if cancelled.State != "cancelled" {
 		t.Fatalf("cancel boundary waiter = %#v", cancelled)
 	}
+	if leaseCount(t, server, "holder") != 1 {
+		t.Fatalf("holder lease count after refusals and cancellation = %d, want 1", leaseCount(t, server, "holder"))
+	}
+	if got := releaseLease(t, server, holder.ID); got.State != "released" {
+		t.Fatalf("release holder = %#v", got)
+	}
+}
+
+// TestWaitTimeoutPreservesHolderLease proves an ordinary timed-out socket wait creates no lease and leaves its holder active.
+func TestWaitTimeoutPreservesHolderLease(t *testing.T) {
+	server := newTestServer(t)
+	addManualResource(t, server, "qa.pool", "qa-01")
+	holder := acquireNoWait(t, server, "holder", "qa.pool")
 	timeoutRequest := WireRequest{Version: 1, Type: "request", Op: "lease.acquire", RequestID: "short-wait", Data: waitData("qa.pool", 50*time.Millisecond)}
 	timedOut, code := Exchange(server.socketPath, timeoutRequest)
 	if code != "" || timedOut.State != "error" || timedOut.Code != "request_timed_out" || timedOut.RequestID != "short-wait" || timedOut.Data["lease"] != nil || timedOut.Data["resource"] != nil {

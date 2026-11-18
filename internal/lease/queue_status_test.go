@@ -94,6 +94,141 @@ func auditRowCount(t *testing.T, server *Server) int64 {
 	return rowInt(rows[0], "n")
 }
 
+func overCapSnapshotsMatchAfterAllowedRows(before, after map[string][]sqlite.Row, requestID string, auditSequence any) bool {
+	if len(after["requests"]) != len(before["requests"])+1 || len(after["audit"]) != len(before["audit"])+1 {
+		return false
+	}
+	filtered := make(map[string][]sqlite.Row, len(after))
+	for name, rows := range after {
+		filtered[name] = append([]sqlite.Row(nil), rows...)
+	}
+	requestsWithoutRefusal := make([]sqlite.Row, 0, len(filtered["requests"])-1)
+	removedRequests := 0
+	for _, row := range filtered["requests"] {
+		if rowString(row, "request_id") == requestID {
+			removedRequests++
+			continue
+		}
+		requestsWithoutRefusal = append(requestsWithoutRefusal, row)
+	}
+	if removedRequests != 1 {
+		return false
+	}
+	auditsWithoutRefusal := make([]sqlite.Row, 0, len(filtered["audit"])-1)
+	removedAudits := 0
+	for _, row := range filtered["audit"] {
+		if reflect.DeepEqual(row["sequence"], auditSequence) {
+			removedAudits++
+			continue
+		}
+		auditsWithoutRefusal = append(auditsWithoutRefusal, row)
+	}
+	if removedAudits != 1 {
+		return false
+	}
+	filtered["requests"] = requestsWithoutRefusal
+	filtered["audit"] = auditsWithoutRefusal
+	return reflect.DeepEqual(filtered, before)
+}
+
+func assertOverCapRefusalEffects(t *testing.T, server *Server, dbPath, requestID, tag string, waitTimeout int64, acquire func() (string, map[string]any, string)) {
+	t.Helper()
+	before := snapshotCanonicalTables(t, dbPath)
+	sequenceRows, err := server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag=?", tag)
+	if err != nil || len(sequenceRows) != 1 {
+		t.Fatalf("read pre-refusal queue sequence for %s: rows=%#v error=%v", tag, sequenceRows, err)
+	}
+	beforeSequence := rowInt(sequenceRows[0], "next_queue_sequence")
+
+	state, data, code := acquire()
+	requestRecord, requestOK := data["request"].(*RequestRecord)
+	if state != "error" || code != "wait_exceeds_max" || !requestOK || requestRecord == nil || requestRecord.RequestID != requestID || requestRecord.State != "refused" || stringValue(requestRecord.OutcomeCode) != "wait_exceeds_max" || requestRecord.WaitTimeout == nil || *requestRecord.WaitTimeout != waitTimeout || requestRecord.QueueSequence != nil || requestRecord.QueuedAt != nil || requestRecord.WaitDeadline != nil || data["lease"] != nil || data["resource"] != nil {
+		t.Fatalf("over-cap refusal = %s/%s/%#v, want only a terminal wait_exceeds_max request", state, code, data)
+	}
+
+	requestRows, err := server.store.db.Query("SELECT state,outcome_code,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns FROM requests WHERE request_id=?", requestID)
+	if err != nil || len(requestRows) != 1 {
+		t.Fatalf("read refused request row: rows=%#v error=%v", requestRows, err)
+	}
+	requestRow := requestRows[0]
+	if rowString(requestRow, "state") != "refused" || rowString(requestRow, "outcome_code") != "wait_exceeds_max" {
+		t.Fatalf("persisted refusal row = %#v, want wait_exceeds_max terminal refusal", requestRow)
+	}
+	for _, field := range []string{"queue_sequence", "queued_at", "wait_deadline_at", "queue_boot_session_id", "queue_started_monotonic_ns", "wait_deadline_monotonic_ns"} {
+		if requestRow[field] != nil {
+			t.Fatalf("refused request field %s = %#v, want NULL", field, requestRow[field])
+		}
+	}
+	queuedRows, err := server.store.db.Query("SELECT request_id FROM requests WHERE request_id=? AND state='queued'", requestID)
+	if err != nil || len(queuedRows) != 0 {
+		t.Fatalf("over-cap request queued rows = %#v, error=%v; want none", queuedRows, err)
+	}
+	leaseRows, err := server.store.db.Query("SELECT request_id FROM leases WHERE request_id=?", requestID)
+	if err != nil || len(leaseRows) != 0 {
+		t.Fatalf("over-cap request leases = %#v, error=%v; want none", leaseRows, err)
+	}
+	auditRows, err := server.store.db.Query("SELECT sequence,operation,request_id,target_id,result_code,from_state,to_state FROM audit WHERE request_id=?", requestID)
+	if err != nil || len(auditRows) != 1 {
+		t.Fatalf("over-cap audit rows = %#v, error=%v; want exactly one", auditRows, err)
+	}
+	auditRow := auditRows[0]
+	if rowString(auditRow, "operation") != "lease.acquire" || rowString(auditRow, "request_id") != requestID || rowString(auditRow, "target_id") != requestID || rowString(auditRow, "result_code") != "wait_exceeds_max" || auditRow["from_state"] != nil || rowString(auditRow, "to_state") != "refused" {
+		t.Fatalf("over-cap audit row = %#v, want the one matching terminal refusal", auditRow)
+	}
+
+	after := snapshotCanonicalTables(t, dbPath)
+	afterSequenceRows, err := server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag=?", tag)
+	if err != nil || len(afterSequenceRows) != 1 {
+		t.Fatalf("read post-refusal queue sequence for %s: rows=%#v error=%v", tag, afterSequenceRows, err)
+	}
+	if afterSequence := rowInt(afterSequenceRows[0], "next_queue_sequence"); afterSequence != beforeSequence {
+		t.Fatalf("over-cap refusal advanced pools.next_queue_sequence: before=%d after=%d", beforeSequence, afterSequence)
+	}
+	if !overCapSnapshotsMatchAfterAllowedRows(before, after, requestID, auditRow["sequence"]) {
+		t.Fatalf("after removing the one allowed refusal and audit row, the six-table snapshot changed:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+// TestOverCapSnapshotControlDetectsQueueSequenceAdvance proves the six-table comparison rejects an over-cap refusal that unexpectedly increments pools.next_queue_sequence; the injected trigger is confined to this fixture.
+func TestOverCapSnapshotControlDetectsQueueSequenceAdvance(t *testing.T) {
+	base := hardEndBaseSample()
+	clock := newControlledLeaseClock(base)
+	server, dbPath := startQueueStatusFixture(t, clock)
+	addQueueStatusResource(t, server, "qa.control", "control-01")
+	acquireQueueStatusHolder(t, server, "qa.control", "control-holder")
+	acquireQueueStatusWaiter(t, server, "qa.control", "control-waiter", int64(time.Hour))
+	before := snapshotCanonicalTables(t, dbPath)
+	sequenceRows, err := server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag=?", "qa.control")
+	if err != nil || len(sequenceRows) != 1 {
+		t.Fatalf("read control pre-refusal sequence: rows=%#v error=%v", sequenceRows, err)
+	}
+	beforeSequence := rowInt(sequenceRows[0], "next_queue_sequence")
+	if err := server.store.db.ExecScript("CREATE TRIGGER inject_queue_sequence_advance AFTER INSERT ON requests WHEN NEW.request_id='counter-control-over-cap' BEGIN UPDATE pools SET next_queue_sequence=next_queue_sequence+1 WHERE tag=NEW.tag; END;"); err != nil {
+		t.Fatalf("install isolated queue-sequence mutation control: %v", err)
+	}
+	over := maxWaitNS + 1
+	state, data, code := server.store.Acquire(AcquireInput{RequestID: "counter-control-over-cap", Tag: "qa.control", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
+	requestRecord, requestOK := data["request"].(*RequestRecord)
+	if state != "error" || code != "wait_exceeds_max" || !requestOK || requestRecord == nil || requestRecord.State != "refused" || data["lease"] != nil {
+		t.Fatalf("mutation-control refusal = %s/%s/%#v, want durable terminal refusal without lease", state, code, data)
+	}
+	auditRows, err := server.store.db.Query("SELECT sequence FROM audit WHERE request_id=? AND result_code='wait_exceeds_max'", "counter-control-over-cap")
+	if err != nil || len(auditRows) != 1 {
+		t.Fatalf("mutation-control audit rows = %#v error=%v, want one", auditRows, err)
+	}
+	after := snapshotCanonicalTables(t, dbPath)
+	sequenceRows, err = server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag=?", "qa.control")
+	if err != nil || len(sequenceRows) != 1 {
+		t.Fatalf("read control post-refusal sequence: rows=%#v error=%v", sequenceRows, err)
+	}
+	if afterSequence := rowInt(sequenceRows[0], "next_queue_sequence"); afterSequence != beforeSequence+1 {
+		t.Fatalf("mutation-control sequence = %d, want injected advance from %d to %d", afterSequence, beforeSequence, beforeSequence+1)
+	}
+	if overCapSnapshotsMatchAfterAllowedRows(before, after, "counter-control-over-cap", auditRows[0]["sequence"]) {
+		t.Fatal("six-table comparison accepted a changed next_queue_sequence after removing the allowed refusal and audit rows")
+	}
+}
+
 // TestQueueStatusCountsCurrentRowsAndUsesTheOldestTimestamp proves exact-tag counts and oldest timestamps across pools, including the update after cancelling the oldest waiter.
 func TestQueueStatusCountsCurrentRowsAndUsesTheOldestTimestamp(t *testing.T) {
 	base := hardEndBaseSample()
@@ -268,7 +403,7 @@ func TestQueueStatusInvalidInputsPreserveState(t *testing.T) {
 	}
 }
 
-// TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads proves 30-minute and exact four-hour waits remain valid, over-cap refusal creates no queue or lease, and a waiter keeps its original FIFO position through two 20-minute holders.
+// TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads proves valid 30-minute and exact four-hour waits remain queued, both over-cap boundaries add only their terminal request and audit row under a frozen no-due clock, and FIFO survives two 20-minute holders.
 func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 	base := hardEndBaseSample()
 	clock := newControlledLeaseClock(base)
@@ -279,22 +414,13 @@ func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 	acquireQueueStatusWaiter(t, server, "qa.fifo", "fifo-waiter-02", maxWaitNS)
 
 	over := maxWaitNS + 1
-	state, refusal, code := server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
-	if state != "error" || code != "wait_exceeds_max" {
-		t.Fatalf("over-cap wait = %s/%s, want wait_exceeds_max", state, code)
-	}
-	refused, ok := refusal["request"].(*RequestRecord)
-	if !ok || refused.State != "refused" || stringValue(refused.OutcomeCode) != "wait_exceeds_max" || refusal["lease"] != nil {
-		t.Fatalf("over-cap result = %#v, want a terminal refusal without lease", refusal)
-	}
-	rows, err := server.store.db.Query("SELECT COUNT(*) AS n FROM requests WHERE request_id=? AND state='queued'", "fifo-over-cap")
-	if err != nil || len(rows) != 1 || rowInt(rows[0], "n") != 0 {
-		t.Fatalf("over-cap queue rows = %#v, %v; want none", rows, err)
-	}
-	rows, err = server.store.db.Query("SELECT COUNT(*) AS n FROM leases WHERE request_id=?", "fifo-over-cap")
-	if err != nil || len(rows) != 1 || rowInt(rows[0], "n") != 0 {
-		t.Fatalf("over-cap leases = %#v, %v; want none", rows, err)
-	}
+	assertOverCapRefusalEffects(t, server, dbPath, "fifo-over-cap", "qa.fifo", over, func() (string, map[string]any, string) {
+		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
+	})
+	overSecond := maxWaitNS + int64(time.Second)
+	assertOverCapRefusalEffects(t, server, dbPath, "fifo-over-cap-plus-second", "qa.fifo", overSecond, func() (string, map[string]any, string) {
+		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap-plus-second", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &overSecond})
+	})
 	data, code := server.store.QueueStatus("qa.fifo")
 	if code != "" {
 		t.Fatalf("initial queue status = %s", code)
