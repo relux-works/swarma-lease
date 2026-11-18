@@ -116,7 +116,7 @@ func TestRejectedSocketInputDoesNotReachServiceProcessOutput(t *testing.T) {
 	const secretMarker = "private/rejected/value-marker"
 	const commandMarker = "synthetic-command-secret-marker"
 	const environmentMarker = "synthetic-environment-secret-marker"
-	rejectedRaw := fmt.Sprintf(`{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-rejection","data":{"tag":%q,"duration_ns":1,"wait_mode":"no_wait","command":%q,"environment":{"SYNTHETIC_TOKEN":%q},"boot_session_id":%q,"monotonic_ns":%d}}`, secretMarker, commandMarker, environmentMarker, privacyBootID, privacyMonoNS)
+	rejectedRaw := fmt.Sprintf(`{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-rejection","data":{"requester_id":"test-caller","tag":%q,"duration_ns":1,"wait_mode":"no_wait","command":%q,"environment":{"SYNTHETIC_TOKEN":%q},"boot_session_id":%q,"monotonic_ns":%d}}`, secretMarker, commandMarker, environmentMarker, privacyBootID, privacyMonoNS)
 	rejected, _ := exchangeRawSocketRequest(t, socketPath, rejectedRaw)
 	if rejected.Code != "invalid_request" || rejected.State != "error" || rejected.RequestID != "privacy-rejection" || len(rejected.Data) != 0 {
 		t.Fatalf("rejected private-looking frame = %#v, want exact invalid_request refusal", rejected)
@@ -131,12 +131,12 @@ func TestRejectedSocketInputDoesNotReachServiceProcessOutput(t *testing.T) {
 	assertPrivacyDatabaseCounts(t, stateDir, 0, 0)
 	assertPrivacyRequestMarkersAbsentFromDatabase(t, stateDir, secretMarker, commandMarker, environmentMarker)
 
-	added, addedFields := exchangeRawSocketRequest(t, socketPath, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.privacy","resource_id":"privacy-control","mode":"manual"}}`)
+	added, addedFields := exchangeRawSocketRequest(t, socketPath, `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.privacy","resource_id":"privacy-control","mode":"manual"}}`)
 	if added.State != "added" || added.Code != "" || len(added.Data) != 2 || added.Data["pool"] == nil || added.Data["resource"] == nil {
 		t.Fatalf("valid resource control = %#v, want allowlisted pool/resource result", added)
 	}
 	assertPrivacyResponseFields(t, addedFields, false)
-	granted, grantedFields := exchangeRawSocketRequest(t, socketPath, `{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-control","data":{"tag":"qa.privacy","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
+	granted, grantedFields := exchangeRawSocketRequest(t, socketPath, `{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-control","data":{"requester_id":"test-caller","tag":"qa.privacy","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
 	if granted.State != "granted" || granted.Code != "" || granted.RequestID != "privacy-control" || len(granted.Data) != 3 || granted.Data["request"] == nil || granted.Data["lease"] == nil || granted.Data["resource"] == nil {
 		t.Fatalf("valid acquisition control = %#v, want allowlisted request/lease/resource result", granted)
 	}
@@ -147,7 +147,7 @@ func TestRejectedSocketInputDoesNotReachServiceProcessOutput(t *testing.T) {
 		t.Fatalf("valid audit control = %#v, want four allowed transition rows", history)
 	}
 	assertPrivacyResponseFields(t, historyFields, false)
-	allowedAuditFields := map[string]bool{"sequence": true, "at": true, "operation": true, "request_id": true, "target_id": true, "result_code": true, "from_state": true, "to_state": true}
+	allowedAuditFields := map[string]bool{"sequence": true, "at": true, "operation": true, "actor_kind": true, "actor_component": true, "cause": true, "cause_ref_kind": true, "cause_ref_id": true, "origin": true, "request_id": true, "requester_id": true, "holder_id": true, "legacy_unattributed": true, "target_id": true, "result_code": true, "from_state": true, "to_state": true}
 	for index, value := range entries {
 		entry, ok := value.(map[string]any)
 		if !ok || len(entry) != len(allowedAuditFields) {
@@ -204,11 +204,11 @@ func assertPrivacyDatabaseCounts(t *testing.T, stateDir string, wantAudit, wantR
 func assertPrivacyRequestMarkersAbsentFromDatabase(t *testing.T, stateDir string, markers ...string) {
 	t.Helper()
 	checks := []string{
-		"SELECT COUNT(*) AS count FROM requests WHERE instr(request_id,?)>0 OR instr(tag,?)>0 OR instr(outcome_code,?)>0",
-		"SELECT COUNT(*) AS count FROM leases WHERE instr(id,?)>0 OR instr(request_id,?)>0 OR instr(resource_id,?)>0 OR instr(state,?)>0",
+		"SELECT COUNT(*) AS count FROM requests WHERE instr(request_id,?)>0 OR instr(requester_id,?)>0 OR instr(tag,?)>0 OR instr(outcome_code,?)>0",
+		"SELECT COUNT(*) AS count FROM leases WHERE instr(id,?)>0 OR instr(request_id,?)>0 OR instr(holder_id,?)>0 OR instr(resource_id,?)>0 OR instr(state,?)>0",
 		"SELECT COUNT(*) AS count FROM resources WHERE instr(id,?)>0 OR instr(tag,?)>0 OR instr(state,?)>0",
 		"SELECT COUNT(*) AS count FROM pools WHERE instr(tag,?)>0 OR instr(mode,?)>0",
-		"SELECT COUNT(*) AS count FROM audit WHERE instr(operation,?)>0 OR instr(request_id,?)>0 OR instr(target_id,?)>0 OR instr(result_code,?)>0 OR instr(from_state,?)>0 OR instr(to_state,?)>0",
+		"SELECT COUNT(*) AS count FROM audit WHERE instr(operation,?)>0 OR instr(actor_component,?)>0 OR instr(cause,?)>0 OR instr(cause_ref_kind,?)>0 OR instr(cause_ref_id,?)>0 OR instr(origin,?)>0 OR instr(request_id,?)>0 OR instr(requester_id,?)>0 OR instr(holder_id,?)>0 OR instr(target_id,?)>0 OR instr(result_code,?)>0 OR instr(from_state,?)>0 OR instr(to_state,?)>0",
 	}
 	db, err := sqlite.Open(filepath.Join(stateDir, "leases.sqlite"))
 	if err != nil {

@@ -9,7 +9,7 @@ func TestRequestEnvelopeAllowsItsDeclaredKeyAndRejectsUnknownKeys(t *testing.T) 
 
 	valid := request(t, server, uid, map[string]any{
 		"version": 1, "type": "request", "op": "lease.acquire", "request_id": "valid-request",
-		"data": map[string]any{"tag": "missing.pool", "duration_ns": int64(1_000_000_000), "wait_mode": "no_wait"},
+		"data": map[string]any{"requester_id": "test-caller", "tag": "missing.pool", "duration_ns": int64(1_000_000_000), "wait_mode": "no_wait"},
 	})
 	if valid.Code != "unknown_tag" {
 		t.Fatalf("declared request_id acquire = %#v, want unknown_tag after envelope acceptance", valid)

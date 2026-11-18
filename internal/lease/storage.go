@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/relux-works/swarma-lease/internal/sqlite"
 )
@@ -168,6 +169,15 @@ func bootstrapDatabase(stateDir, finalPath string, ownerUID int64, clock Clock) 
 		if err != nil {
 			return err
 		}
+		for _, class := range []struct {
+			name       string
+			priority   int64
+			maxLeaseNS int64
+		}{{"go-test", 1, maxLeaseNS}, {"jvm-build", 2, int64(30 * time.Minute)}} {
+			if _, err := tx.Exec("INSERT INTO lease_classes(class,priority,max_active,max_lease_ns,next_queue_sequence,created_at) VALUES(?,?,1,?,1,?)", class.name, class.priority, class.maxLeaseNS, timestamp(sample.Wall)); err != nil {
+				return err
+			}
+		}
 		for _, pool := range []struct{ tag, resource string }{{"mac.go-test", "go-test-01"}, {"mac.swift-test", "swift-test-01"}} {
 			if _, err := tx.Exec("INSERT INTO pools(tag,mode,next_queue_sequence,created_at) VALUES(?, 'command', 1, ?)", pool.tag, timestamp(sample.Wall)); err != nil {
 				return err
@@ -222,25 +232,121 @@ func migrateDatabase(tx *sqlite.Tx, ownerUID int64) error {
 	switch version {
 	case schemaVersion:
 		return validateDatabaseVersion(tx, ownerUID, schemaVersion)
-	case 1:
-		if err := validateDatabaseVersion(tx, ownerUID, 1); err != nil {
+	case schemaV1Version:
+		if err := validateDatabaseVersion(tx, ownerUID, schemaV1Version); err != nil {
+			return err
+		}
+		if err := migrateV1ToV2(tx); err != nil {
+			return err
+		}
+		if err := validateDatabaseVersion(tx, ownerUID, schemaV2Version); err != nil {
+			return err
+		}
+	case schemaV2Version:
+		if err := validateDatabaseVersion(tx, ownerUID, schemaV2Version); err != nil {
 			return err
 		}
 	default:
 		return errIncompatible
 	}
+	if err := migrateV2ToV3(tx); err != nil {
+		return err
+	}
+	return validateDatabaseVersion(tx, ownerUID, schemaVersion)
+}
 
+func migrateV1ToV2(tx *sqlite.Tx) error {
 	if err := tx.ExecScript("ALTER TABLE settings RENAME TO settings_v1;\n" + settingsV2SQL); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at)
-SELECT singleton_id,?,owner_uid,max_lease_ns,?,boot_session_id,created_at FROM settings_v1`, schemaVersion, maxWaitNS); err != nil {
+SELECT singleton_id,?,owner_uid,max_lease_ns,?,boot_session_id,created_at FROM settings_v1`, schemaV2Version, maxWaitNS); err != nil {
 		return err
 	}
-	if err := tx.ExecScript("DROP TABLE settings_v1;\nPRAGMA user_version=2;"); err != nil {
+	return tx.ExecScript("DROP TABLE settings_v1;\nPRAGMA user_version=2;")
+}
+
+func migrateV2ToV3(tx *sqlite.Tx) error {
+	if err := tx.ExecScript(
+		"DROP INDEX requests_tag_queue_sequence;\n" +
+			"DROP INDEX leases_one_active_resource;\n" +
+			"ALTER TABLE audit RENAME TO audit_v2;\n" +
+			"ALTER TABLE leases RENAME TO leases_v2;\n" +
+			"ALTER TABLE requests RENAME TO requests_v2;\n" +
+			"ALTER TABLE resources RENAME TO resources_v2;\n" +
+			"ALTER TABLE pools RENAME TO pools_v2;\n" +
+			"ALTER TABLE settings RENAME TO settings_v2;\n"); err != nil {
 		return err
 	}
-	return validateDatabaseVersion(tx, ownerUID, schemaVersion)
+	if err := tx.ExecScript(schemaSQL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO settings(singleton_id,schema_version,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at) SELECT singleton_id,3,owner_uid,max_lease_ns,max_wait_ns,boot_session_id,created_at FROM settings_v2"); err != nil {
+		return err
+	}
+	settings, err := tx.Query("SELECT created_at FROM settings_v2 WHERE singleton_id=1")
+	if err != nil || len(settings) != 1 {
+		return errIncompatible
+	}
+	createdAt := rowString(settings[0], "created_at")
+	for _, class := range []struct {
+		name       string
+		priority   int64
+		maxLeaseNS int64
+	}{{"go-test", 1, maxLeaseNS}, {"jvm-build", 2, int64(30 * time.Minute)}} {
+		if _, err := tx.Exec("INSERT INTO lease_classes(class,priority,max_active,max_lease_ns,next_queue_sequence,created_at) VALUES(?,?,1,?,1,?)", class.name, class.priority, class.maxLeaseNS, createdAt); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO pools(tag,class,mode,next_queue_sequence,created_at) SELECT tag,CASE WHEN mode='manual' AND tag='mac.go-test-manual' THEN 'go-test' WHEN mode='manual' AND tag='mac.jvm-build' THEN 'jvm-build' ELSE NULL END,mode,next_queue_sequence,created_at FROM pools_v2"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO resources(id,tag,state,fencing_token,created_at,updated_at) SELECT id,tag,state,fencing_token,created_at,updated_at FROM resources_v2"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,class,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,class_queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) SELECT r.request_id,NULL,1,r.tag,p.class,r.duration_ns,r.wait_mode,r.wait_timeout_ns,r.queue_sequence,NULL,r.queued_at,r.wait_deadline_at,r.queue_boot_session_id,r.queue_started_monotonic_ns,r.wait_deadline_monotonic_ns,r.state,r.outcome_code,r.created_at,r.updated_at FROM requests_v2 r LEFT JOIN pools p ON p.tag=r.tag"); err != nil {
+		return err
+	}
+	classes, err := tx.Query("SELECT class FROM lease_classes ORDER BY class COLLATE BINARY")
+	if err != nil {
+		return err
+	}
+	for _, classRow := range classes {
+		class := rowString(classRow, "class")
+		queued, err := tx.Query("SELECT request_id FROM requests WHERE class=? AND state='queued' ORDER BY queued_at COLLATE BINARY,tag COLLATE BINARY,queue_sequence,request_id COLLATE BINARY", class)
+		if err != nil {
+			return err
+		}
+		for i, request := range queued {
+			if _, err := tx.Exec("UPDATE requests SET class_queue_sequence=? WHERE request_id=?", int64(i+1), rowString(request, "request_id")); err != nil {
+				return err
+			}
+		}
+		poolRows, err := tx.Query("SELECT COALESCE(SUM(next_queue_sequence-1),0) AS used FROM pools_v2 WHERE mode='manual' AND ((tag='mac.go-test-manual' AND ?='go-test') OR (tag='mac.jvm-build' AND ?='jvm-build'))", class, class)
+		if err != nil || len(poolRows) != 1 {
+			return errIncompatible
+		}
+		nextSequence := rowInt(poolRows[0], "used") + 1
+		if nextSequence < int64(len(queued))+1 {
+			nextSequence = int64(len(queued)) + 1
+		}
+		if _, err := tx.Exec("UPDATE lease_classes SET next_queue_sequence=? WHERE class=?", nextSequence, class); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO leases(id,request_id,holder_id,legacy_unattributed,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token) SELECT id,request_id,NULL,1,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token FROM leases_v2"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO audit(sequence,at,operation,actor_kind,actor_component,cause,cause_ref_kind,cause_ref_id,origin,request_id,requester_id,holder_id,legacy_unattributed,target_id,result_code,from_state,to_state) SELECT sequence,at,operation,'legacy',NULL,NULL,NULL,NULL,'pre_v3',request_id,NULL,NULL,1,target_id,result_code,from_state,to_state FROM audit_v2"); err != nil {
+		return err
+	}
+	return tx.ExecScript(
+		"DROP TABLE audit_v2;\n" +
+			"DROP TABLE leases_v2;\n" +
+			"DROP TABLE requests_v2;\n" +
+			"DROP TABLE resources_v2;\n" +
+			"DROP TABLE pools_v2;\n" +
+			"DROP TABLE settings_v2;\n")
 }
 
 func (s *Store) migrateAndRecover() error {
@@ -278,7 +384,7 @@ func validateDatabaseVersion(db databaseQueryer, ownerUID, version int64) error 
 		return errCorrupt
 	}
 	rows, err = db.Query("PRAGMA user_version")
-	if err != nil || len(rows) != 1 || rowInt(rows[0], "user_version") != version || (version != 1 && version != schemaVersion) {
+	if err != nil || len(rows) != 1 || rowInt(rows[0], "user_version") != version || (version != schemaV1Version && version != schemaV2Version && version != schemaVersion) {
 		return errIncompatible
 	}
 	expected := map[string][]string{
@@ -288,6 +394,28 @@ func validateDatabaseVersion(db databaseQueryer, ownerUID, version int64) error 
 		"requests":  {"request_id", "tag", "duration_ns", "wait_mode", "wait_timeout_ns", "queue_sequence", "queued_at", "wait_deadline_at", "queue_boot_session_id", "queue_started_monotonic_ns", "wait_deadline_monotonic_ns", "state", "outcome_code", "created_at", "updated_at"},
 		"leases":    {"id", "request_id", "resource_id", "state", "duration_ns", "granted_at", "hard_end_at", "boot_session_id", "granted_monotonic_ns", "hard_end_monotonic_ns", "fencing_token", "ended_at", "ended_resource_state", "ended_fencing_token"},
 		"audit":     {"sequence", "at", "operation", "request_id", "target_id", "result_code", "from_state", "to_state"},
+	}
+	wantObjects := map[string]bool{
+		"table:audit": true, "table:leases": true, "table:pools": true,
+		"table:requests": true, "table:resources": true, "table:settings": true,
+		"index:leases_one_active_resource": true, "index:requests_tag_queue_sequence": true,
+	}
+	if version == schemaVersion {
+		expected = map[string][]string{
+			"settings":      {"singleton_id", "schema_version", "owner_uid", "max_lease_ns", "max_wait_ns", "boot_session_id", "created_at"},
+			"lease_classes": {"class", "priority", "max_active", "max_lease_ns", "next_queue_sequence", "created_at"},
+			"pools":         {"tag", "class", "mode", "next_queue_sequence", "created_at"},
+			"resources":     {"id", "tag", "state", "fencing_token", "created_at", "updated_at"},
+			"requests":      {"request_id", "requester_id", "legacy_unattributed", "tag", "class", "duration_ns", "wait_mode", "wait_timeout_ns", "queue_sequence", "class_queue_sequence", "queued_at", "wait_deadline_at", "queue_boot_session_id", "queue_started_monotonic_ns", "wait_deadline_monotonic_ns", "state", "outcome_code", "created_at", "updated_at"},
+			"leases":        {"id", "request_id", "holder_id", "legacy_unattributed", "resource_id", "state", "duration_ns", "granted_at", "hard_end_at", "boot_session_id", "granted_monotonic_ns", "hard_end_monotonic_ns", "fencing_token", "ended_at", "ended_resource_state", "ended_fencing_token"},
+			"audit":         {"sequence", "at", "operation", "actor_kind", "actor_component", "cause", "cause_ref_kind", "cause_ref_id", "origin", "request_id", "requester_id", "holder_id", "legacy_unattributed", "target_id", "result_code", "from_state", "to_state"},
+		}
+		wantObjects = map[string]bool{
+			"table:audit": true, "table:lease_classes": true, "table:leases": true,
+			"table:pools": true, "table:requests": true, "table:resources": true, "table:settings": true,
+			"index:leases_one_active_resource": true, "index:requests_class_queue_sequence": true,
+			"index:requests_tag_queue_sequence": true,
+		}
 	}
 	for table, columns := range expected {
 		actual, err := db.Query("PRAGMA table_info(" + table + ")")
@@ -303,11 +431,6 @@ func validateDatabaseVersion(db databaseQueryer, ownerUID, version int64) error 
 	objects, err := db.Query("SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")
 	if err != nil {
 		return errIncompatible
-	}
-	wantObjects := map[string]bool{
-		"table:audit": true, "table:leases": true, "table:pools": true,
-		"table:requests": true, "table:resources": true, "table:settings": true,
-		"index:leases_one_active_resource": true, "index:requests_tag_queue_sequence": true,
 	}
 	wantDefinitions := expectedSchemaDefinitionsFor(version)
 	if len(objects) != len(wantObjects) || len(wantDefinitions) != len(wantObjects) {
@@ -369,8 +492,12 @@ func validateLiveEpochs(db databaseQueryer, settingsBootID string) error {
 }
 
 func expectedSchemaDefinitions() map[string]string {
+	return expectedSchemaDefinitionsFrom(schemaSQL)
+}
+
+func expectedSchemaDefinitionsFrom(schema string) map[string]string {
 	definitions := make(map[string]string)
-	for _, statement := range strings.Split(schemaSQL, ";") {
+	for _, statement := range strings.Split(schema, ";") {
 		fields := strings.Fields(strings.TrimSpace(statement))
 		if len(fields) < 3 || !strings.EqualFold(fields[0], "CREATE") {
 			continue
@@ -392,8 +519,12 @@ func expectedSchemaDefinitions() map[string]string {
 }
 
 func expectedSchemaDefinitionsFor(version int64) map[string]string {
-	definitions := expectedSchemaDefinitions()
-	if version == 1 {
+	schema := schemaSQL
+	if version == schemaV1Version || version == schemaV2Version {
+		schema = schemaV2SQL
+	}
+	definitions := expectedSchemaDefinitionsFrom(schema)
+	if version == schemaV1Version {
 		definitions["table:settings"] = normalizeSchemaSQL(strings.TrimSuffix(settingsV1SQL, ";"))
 	}
 	return definitions

@@ -30,7 +30,7 @@ func startQueueStatusFixture(t *testing.T, clock Clock) (*Server, string) {
 
 func addQueueStatusResource(t *testing.T, server *Server, tag, id string) {
 	t.Helper()
-	state, _, code := server.store.AddResource(tag, id, "manual")
+	state, _, code := server.store.AddResource(tag, id, "manual", "test-caller")
 	if code != "" || state != "added" {
 		t.Fatalf("add queue-status resource = %s/%s, want added", state, code)
 	}
@@ -38,7 +38,7 @@ func addQueueStatusResource(t *testing.T, server *Server, tag, id string) {
 
 func acquireQueueStatusHolder(t *testing.T, server *Server, tag, requestID string) LeaseRecord {
 	t.Helper()
-	state, data, code := server.store.Acquire(AcquireInput{RequestID: requestID, Tag: tag, DurationNS: maxLeaseNS, WaitMode: "no_wait"})
+	state, data, code := server.store.Acquire(AcquireInput{RequestID: requestID, RequesterID: "test-caller", Tag: tag, DurationNS: maxLeaseNS, WaitMode: "no_wait"})
 	lease, ok := data["lease"].(LeaseRecord)
 	if code != "" || state != "granted" || !ok {
 		t.Fatalf("acquire holder = %s/%s/%#v, want granted lease", state, code, data)
@@ -48,7 +48,7 @@ func acquireQueueStatusHolder(t *testing.T, server *Server, tag, requestID strin
 
 func acquireQueueStatusWaiter(t *testing.T, server *Server, tag, requestID string, timeout int64) {
 	t.Helper()
-	state, _, code := server.store.Acquire(AcquireInput{RequestID: requestID, Tag: tag, DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &timeout})
+	state, _, code := server.store.Acquire(AcquireInput{RequestID: requestID, RequesterID: "test-caller", Tag: tag, DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &timeout})
 	if code != "" || state != "queued" {
 		t.Fatalf("acquire waiter %s = %s/%s, want queued", requestID, state, code)
 	}
@@ -207,7 +207,7 @@ func TestOverCapSnapshotControlDetectsQueueSequenceAdvance(t *testing.T) {
 		t.Fatalf("install isolated queue-sequence mutation control: %v", err)
 	}
 	over := maxWaitNS + 1
-	state, data, code := server.store.Acquire(AcquireInput{RequestID: "counter-control-over-cap", Tag: "qa.control", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
+	state, data, code := server.store.Acquire(AcquireInput{RequestID: "counter-control-over-cap", RequesterID: "test-caller", Tag: "qa.control", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
 	requestRecord, requestOK := data["request"].(*RequestRecord)
 	if state != "error" || code != "wait_exceeds_max" || !requestOK || requestRecord == nil || requestRecord.State != "refused" || data["lease"] != nil {
 		t.Fatalf("mutation-control refusal = %s/%s/%#v, want durable terminal refusal without lease", state, code, data)
@@ -277,7 +277,7 @@ func TestQueueStatusCountsCurrentRowsAndUsesTheOldestTimestamp(t *testing.T) {
 	addQueueStatusResource(t, server, "qa.disabled", "a-held")
 	addQueueStatusResource(t, server, "qa.disabled", "z-disabled")
 	acquireQueueStatusHolder(t, server, "qa.disabled", "disabled-holder")
-	if state, _, code := server.store.SetResource("resource.disable", "z-disabled", false); code != "" || state != "disabled" {
+	if state, _, code := server.store.SetResource("resource.disable", "z-disabled", false, "test-caller"); code != "" || state != "disabled" {
 		t.Fatalf("disable unused pool capacity = %s/%s, want disabled", state, code)
 	}
 	acquireQueueStatusWaiter(t, server, "qa.disabled", "disabled-waiter", int64(time.Hour))
@@ -286,13 +286,13 @@ func TestQueueStatusCountsCurrentRowsAndUsesTheOldestTimestamp(t *testing.T) {
 		t.Fatalf("disabled-pool queue status = %s, want success", code)
 	}
 	queueStatusCount(t, data, "qa.disabled", 1, timestamp(base.Wall.Add(4*time.Second)))
-	state, _, code := server.store.Acquire(AcquireInput{RequestID: "command-check", Tag: "mac.go-test", DurationNS: maxLeaseNS, WaitMode: "no_wait"})
+	state, _, code := server.store.Acquire(AcquireInput{RequestID: "command-check", RequesterID: "test-caller", Tag: "mac.go-test", DurationNS: maxLeaseNS, WaitMode: "no_wait"})
 	if state != "error" || code != "adapter_required" {
 		t.Fatalf("command-pool acquisition = %s/%s, want adapter_required", state, code)
 	}
 }
 
-// TestQueueStatusDoesNotExpireRows proves the pure read shifts the oldest timestamp past an elapsed waiter without changing bytes or state, while a later real scheduler operation times it out and keeps the next waiter queued.
+// TestQueueStatusDoesNotExpireRows proves the pure read shifts the oldest timestamp past an elapsed waiter without changing bytes or state, while a later real scheduler operation writes a system timeout row with inherited caller identity and keeps the next waiter queued.
 func TestQueueStatusDoesNotExpireRows(t *testing.T) {
 	base := hardEndBaseSample()
 	clock := newControlledLeaseClock(base)
@@ -334,7 +334,7 @@ func TestQueueStatusDoesNotExpireRows(t *testing.T) {
 		t.Fatalf("request status after pure read = %s/%s, want queued", requestState, code)
 	}
 
-	state, _, code = server.store.Acquire(AcquireInput{RequestID: "expiry-scheduler", Tag: "qa.expiry", DurationNS: maxLeaseNS, WaitMode: "no_wait"})
+	state, _, code = server.store.Acquire(AcquireInput{RequestID: "expiry-scheduler", RequesterID: "test-caller", Tag: "qa.expiry", DurationNS: maxLeaseNS, WaitMode: "no_wait"})
 	if state != "error" || code != "no_wait_busy" {
 		t.Fatalf("real scheduler operation = %s/%s, want no_wait_busy while holder remains active", state, code)
 	}
@@ -342,6 +342,17 @@ func TestQueueStatusDoesNotExpireRows(t *testing.T) {
 	requestRecord, ok := requestData["request"].(*RequestRecord)
 	if code != "" || requestState != "timed_out" || !ok || requestRecord.QueueSequence == nil || *requestRecord.QueueSequence != *beforeSequence {
 		t.Fatalf("scheduler timeout result = %s/%s/%#v, want timed_out at original sequence", requestState, code, requestData)
+	}
+	auditRows, err := server.store.db.Query(`SELECT operation,actor_kind,actor_component,cause,cause_ref_kind,cause_ref_id,request_id,requester_id,legacy_unattributed,origin
+FROM audit WHERE request_id='expiry-waiter' ORDER BY sequence`)
+	if err != nil || len(auditRows) != 2 {
+		t.Fatalf("timeout audit rows = %#v, %v; want caller request and system timeout", auditRows, err)
+	}
+	if rowString(auditRows[0], "actor_kind") != "caller" || rowString(auditRows[0], "operation") != "lease.acquire" || nullableString(auditRows[0], "cause") != nil {
+		t.Fatalf("wait request audit row = %#v, want caller action", auditRows[0])
+	}
+	if rowString(auditRows[1], "actor_kind") != "system" || rowString(auditRows[1], "actor_component") != "scheduler" || rowString(auditRows[1], "cause") != "timeout" || rowString(auditRows[1], "cause_ref_kind") != "request" || rowString(auditRows[1], "cause_ref_id") != "expiry-waiter" || rowString(auditRows[1], "requester_id") != "test-caller" || rowString(auditRows[1], "request_id") != "expiry-waiter" || rowInt(auditRows[1], "legacy_unattributed") != 0 || nullableString(auditRows[1], "origin") != nil {
+		t.Fatalf("scheduler timeout audit row = %#v, want system cause with inherited v3 identity", auditRows[1])
 	}
 	nextState, _, code := server.store.Status("expiry-waiter-next", "")
 	if code != "" || nextState != "queued" {
@@ -353,7 +364,7 @@ func TestQueueStatusDoesNotExpireRows(t *testing.T) {
 	}
 	queueStatusCount(t, data, "qa.expiry", 1, timestamp(base.Wall.Add(time.Second)))
 	originalWait := int64(10 * time.Second)
-	state, _, code = server.store.Acquire(AcquireInput{RequestID: "expiry-waiter", Tag: "qa.expiry", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &originalWait})
+	state, _, code = server.store.Acquire(AcquireInput{RequestID: "expiry-waiter", RequesterID: "test-caller", Tag: "qa.expiry", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &originalWait})
 	if state != "error" || code != "request_timed_out" {
 		t.Fatalf("replay after timeout = %s/%s, want the stored terminal outcome", state, code)
 	}
@@ -415,11 +426,11 @@ func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 
 	over := maxWaitNS + 1
 	assertOverCapRefusalEffects(t, server, dbPath, "fifo-over-cap", "qa.fifo", over, func() (string, map[string]any, string) {
-		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
+		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap", RequesterID: "test-caller", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &over})
 	})
 	overSecond := maxWaitNS + int64(time.Second)
 	assertOverCapRefusalEffects(t, server, dbPath, "fifo-over-cap-plus-second", "qa.fifo", overSecond, func() (string, map[string]any, string) {
-		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap-plus-second", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &overSecond})
+		return server.store.Acquire(AcquireInput{RequestID: "fifo-over-cap-plus-second", RequesterID: "test-caller", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &overSecond})
 	})
 	data, code := server.store.QueueStatus("qa.fifo")
 	if code != "" {
@@ -448,7 +459,7 @@ func TestFourHourWaitCapAndFIFOAfterTwoLeaseHeads(t *testing.T) {
 	}
 	clock.set(hardEndSampleAfter(base, 25*time.Minute, 25*time.Minute))
 	fourHourWait := maxWaitNS
-	state, _, code := server.store.Acquire(AcquireInput{RequestID: "fifo-waiter-02", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &fourHourWait})
+	state, _, code := server.store.Acquire(AcquireInput{RequestID: "fifo-waiter-02", RequesterID: "test-caller", Tag: "qa.fifo", DurationNS: maxLeaseNS, WaitMode: "wait", WaitTimeoutNS: &fourHourWait})
 	if code != "" || state != "queued" {
 		t.Fatalf("same-key retry at 25 minutes = %s/%s, want existing queued request", state, code)
 	}
@@ -502,8 +513,8 @@ func TestQueueStatusUsesOneReadSnapshot(t *testing.T) {
 			}
 			at := timestamp(base.Wall)
 			deadlineAt := timestamp(base.Wall.Add(time.Minute))
-			_, err := tx.Exec(`INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',NULL,?,?)`, "snapshot-waiter", "qa.snapshot", int64(10*time.Second), "wait", int64(time.Minute), int64(1), at, deadlineAt, base.BootSessionID, base.MonotonicNS, base.MonotonicNS+int64(time.Minute), at, at)
+			_, err := tx.Exec(`INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at)
+VALUES(?,?,0,?,?,?,?,?,?,?,?,?,?,'queued',NULL,?,?)`, "snapshot-waiter", "test-caller", "qa.snapshot", int64(10*time.Second), "wait", int64(time.Minute), int64(1), at, deadlineAt, base.BootSessionID, base.MonotonicNS, base.MonotonicNS+int64(time.Minute), at, at)
 			return err
 		})
 	}

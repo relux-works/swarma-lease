@@ -66,7 +66,7 @@ func startFixture(t *testing.T) (*lease.Server, string) {
 func runJSON(t *testing.T, socket string, args ...string) (int, result) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	exit := RunAtSocket(args, &stdout, &stderr, socket)
+	exit := RunAtSocket(withTestRequesterID(args), &stdout, &stderr, socket)
 	if stderr.Len() != 0 {
 		t.Fatalf("management command wrote to stderr: %q", stderr.String())
 	}
@@ -75,6 +75,23 @@ func runJSON(t *testing.T, socket string, args ...string) (int, result) {
 		t.Fatalf("decode one JSON result %q: %v", stdout.String(), err)
 	}
 	return exit, got
+}
+
+func withTestRequesterID(args []string) []string {
+	if len(args) < 2 {
+		return args
+	}
+	requiresCaller := args[0] == "lease" && args[1] == "request"
+	requiresCaller = requiresCaller || args[0] == "resource" && (args[1] == "add" || args[1] == "disable" || args[1] == "enable" || args[1] == "recover")
+	if !requiresCaller {
+		return args
+	}
+	for _, arg := range args[2:] {
+		if arg == "--requester-id" || strings.HasPrefix(arg, "--requester-id=") {
+			return args
+		}
+	}
+	return append(append([]string(nil), args...), "--requester-id", "test-caller")
 }
 
 func assertStoredRequestRefusal(t *testing.T, socket string, code int, got result, wantExit int, wantCode, wantID string) {
@@ -128,20 +145,22 @@ func assertServiceSnapshot(t *testing.T, got result, wantActive, wantQueued floa
 	t.Fatalf("service status has no resource %s", resourceID)
 }
 
-// TestRequestReleaseUsesRealService proves the CLI registers a resource, obtains one durable SQLite-backed lease through the Unix socket, replays the same request, and releases the same lease idempotently.
+// TestRequestReleaseUsesRealService proves the CLI carries an opaque caller ID unchanged through a durable request, lease, replay, and release.
 func TestRequestReleaseUsesRealService(t *testing.T) {
 	_, socket := startFixture(t)
 
 	if code, got := runJSON(t, socket, "resource", "add", "--tag", "qa.pool", "--id", "qa-01", "--mode", "manual", "--json"); code != 0 || got.State != "added" {
 		t.Fatalf("resource add = (%d, %#v), want success", code, got)
 	}
-	args := []string{"lease", "request", "--tag", "qa.pool", "--duration", "30s", "--no-wait", "--request-id", "req-01", "--json"}
+	callerID := "opaque caller:/ λ"
+	args := []string{"lease", "request", "--tag", "qa.pool", "--duration", "30s", "--no-wait", "--request-id", "req-01", "--requester-id", callerID, "--json"}
 	code, first := runJSON(t, socket, args...)
 	if code != 0 || first.State != "granted" || first.RequestID != "req-01" {
 		t.Fatalf("first acquire = (%d, %#v), want committed grant", code, first)
 	}
 	leaseRecord, ok := first.Data["lease"].(map[string]any)
-	if !ok || leaseRecord["resource_id"] != "qa-01" || leaseRecord["fencing_token"] != float64(1) {
+	requestRecord, requestOK := first.Data["request"].(map[string]any)
+	if !ok || !requestOK || requestRecord["requester_id"] != callerID || requestRecord["legacy_unattributed"] != false || leaseRecord["holder_id"] != callerID || leaseRecord["legacy_unattributed"] != false || leaseRecord["resource_id"] != "qa-01" || leaseRecord["fencing_token"] != float64(1) {
 		t.Fatalf("grant lease = %#v, want qa-01 with fencing token 1", first.Data["lease"])
 	}
 
@@ -149,10 +168,17 @@ func TestRequestReleaseUsesRealService(t *testing.T) {
 	if code != 0 || repeated.State != "granted" || repeated.Data["lease"] == nil || repeated.Data["lease"].(map[string]any)["id"] != leaseRecord["id"] {
 		t.Fatalf("identical request replay = (%d, %#v), want the same lease", code, repeated)
 	}
+	code, status := runJSON(t, socket, "lease", "status", "--request-id", "req-01", "--json")
+	statusRequest, statusRequestOK := status.Data["request"].(map[string]any)
+	statusLease, statusLeaseOK := status.Data["lease"].(map[string]any)
+	if code != 0 || status.State != "leased" || !statusRequestOK || !statusLeaseOK || statusRequest["requester_id"] != callerID || statusLease["holder_id"] != callerID {
+		t.Fatalf("status identity = (%d,%#v), want the stored caller ID", code, status)
+	}
 
 	leaseID := leaseRecord["id"].(string)
 	code, released := runJSON(t, socket, "lease", "release", "--id", leaseID, "--json")
-	if code != 0 || released.State != "released" {
+	releasedLease, releasedLeaseOK := released.Data["lease"].(map[string]any)
+	if code != 0 || released.State != "released" || !releasedLeaseOK || releasedLease["holder_id"] != callerID {
 		t.Fatalf("release = (%d, %#v), want released", code, released)
 	}
 	code, repeatedRelease := runJSON(t, socket, "lease", "release", "--id", leaseID, "--json")
@@ -170,6 +196,111 @@ func TestRequestReleaseUsesRealService(t *testing.T) {
 	neighborLease, ok := neighbor.Data["lease"].(map[string]any)
 	if !ok || neighborLease["resource_id"] != "qa-02" {
 		t.Fatalf("neighbor lease = %#v, want resource qa-02", neighbor.Data["lease"])
+	}
+}
+
+// TestLeaseRequestRequiresCallerIdentityBeforeTransport proves a missing or invalid caller ID is rejected locally while a valid 128-byte UTF-8 ID is serialized byte-for-byte.
+func TestLeaseRequestRequiresCallerIdentityBeforeTransport(t *testing.T) {
+	base := []string{"lease", "request", "--tag", "qa.pool", "--duration", "10s", "--no-wait", "--request-id", "caller-validation", "--json"}
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{name: "missing"},
+		{name: "missing-value-before-json"},
+		{name: "empty", id: ""},
+		{name: "control", id: "bad\nvalue"},
+		{name: "too-long", id: strings.Repeat("x", 129)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string(nil), base...), "--requester-id", tc.id)
+			switch tc.name {
+			case "missing":
+				args = base
+			case "missing-value-before-json":
+				args = append(append([]string(nil), base[:len(base)-1]...), "--requester-id", "--json")
+			}
+			var stdout, stderr bytes.Buffer
+			code := RunAtSocket(args, &stdout, &stderr, filepath.Join(t.TempDir(), "not-created.sock"))
+			var got result
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode local refusal %q: %v", stdout.String(), err)
+			}
+			if code != 2 || stderr.Len() != 0 || got.State != "error" || got.Code != "invalid_requester_id" || got.RequestID != "caller-validation" || len(got.Data) != 0 {
+				t.Fatalf("caller ID refusal = (%d,%#v,%q), want local invalid_requester_id", code, got, stderr.String())
+			}
+		})
+	}
+
+	callerID := strings.Repeat("λ", 64)
+	args := append(append([]string(nil), base...), "--requester-id", callerID)
+	request, err := buildRequest(args)
+	data, dataOK := request.Data.(map[string]any)
+	if err != nil || !dataOK || data["requester_id"] != callerID {
+		t.Fatalf("valid caller ID request = %#v, %v; want byte-exact ID", request, err)
+	}
+	flagLikeID := append(append([]string(nil), base[:len(base)-1]...), "--requester-id=--json", "--json")
+	request, err = buildRequest(flagLikeID)
+	data, dataOK = request.Data.(map[string]any)
+	if err != nil || !dataOK || data["requester_id"] != "--json" {
+		t.Fatalf("flag-like caller ID request = %#v, %v; want byte-exact ID through the unambiguous inline form", request, err)
+	}
+}
+
+// TestResourceMutationsRequireCallerIdentityBeforeTransport proves every resource mutation refuses missing or invalid caller input locally and serializes a valid opaque ID unchanged.
+func TestResourceMutationsRequireCallerIdentityBeforeTransport(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "add", args: []string{"resource", "add", "--tag", "qa.pool", "--id", "qa-01", "--mode", "manual", "--json"}},
+		{name: "disable", args: []string{"resource", "disable", "--id", "qa-01", "--json"}},
+		{name: "enable", args: []string{"resource", "enable", "--id", "qa-01", "--json"}},
+		{name: "recover", args: []string{"resource", "recover", "--id", "qa-01", "--confirm-stopped", "--json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var missingOut, missingErr bytes.Buffer
+			missingCode := RunAtSocket(tc.args, &missingOut, &missingErr, filepath.Join(t.TempDir(), "not-created.sock"))
+			var missingResult result
+			if err := json.Unmarshal(missingOut.Bytes(), &missingResult); err != nil {
+				t.Fatalf("decode missing caller refusal %q: %v", missingOut.String(), err)
+			}
+			if missingCode != 2 || missingErr.Len() != 0 || missingResult.State != "error" || missingResult.Code != "invalid_requester_id" || len(missingResult.Data) != 0 {
+				t.Fatalf("missing caller refusal = (%d,%#v,%q), want local invalid_requester_id", missingCode, missingResult, missingErr.String())
+			}
+
+			missingValueArgs := append(append([]string(nil), tc.args[:len(tc.args)-1]...), "--requester-id", "--json")
+			var missingValueOut, missingValueErr bytes.Buffer
+			missingValueCode := RunAtSocket(missingValueArgs, &missingValueOut, &missingValueErr, filepath.Join(t.TempDir(), "not-created.sock"))
+			var missingValueResult result
+			if err := json.Unmarshal(missingValueOut.Bytes(), &missingValueResult); err != nil {
+				t.Fatalf("decode missing-value refusal %q: %v", missingValueOut.String(), err)
+			}
+			if missingValueCode != 2 || missingValueErr.Len() != 0 || missingValueResult.State != "error" || missingValueResult.Code != "invalid_requester_id" || len(missingValueResult.Data) != 0 {
+				t.Fatalf("missing-value caller refusal = (%d,%#v,%q), want local invalid_requester_id", missingValueCode, missingValueResult, missingValueErr.String())
+			}
+
+			for _, callerID := range []string{"", strings.Repeat("x", 129), "bad\nvalue"} {
+				args := append(append([]string(nil), tc.args...), "--requester-id", callerID)
+				var stdout, stderr bytes.Buffer
+				code := RunAtSocket(args, &stdout, &stderr, filepath.Join(t.TempDir(), "not-created.sock"))
+				var got result
+				if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+					t.Fatalf("decode local caller refusal %q: %v", stdout.String(), err)
+				}
+				if code != 2 || stderr.Len() != 0 || got.State != "error" || got.Code != "invalid_requester_id" || len(got.Data) != 0 {
+					t.Fatalf("caller %q refusal = (%d,%#v,%q), want local invalid_requester_id", callerID, code, got, stderr.String())
+				}
+			}
+
+			callerID := "opaque caller:/ λ"
+			args := append(append([]string(nil), tc.args...), "--requester-id", callerID)
+			request, err := buildRequest(args)
+			data, dataOK := request.Data.(map[string]any)
+			if err != nil || !dataOK || data["requester_id"] != callerID {
+				t.Fatalf("valid caller request = %#v, %v; want byte-exact ID", request, err)
+			}
+		})
 	}
 }
 
@@ -475,6 +606,22 @@ func TestHistoryCLIFormsReadTheExpectedAuditWindow(t *testing.T) {
 			if code != 0 || got.State != "ok" || !ok || len(entries) != tc.want {
 				t.Fatalf("history %v = (%d,%#v), want %d entries", tc.args, code, got, tc.want)
 			}
+			if tc.name == "default" {
+				leaseRows := 0
+				for _, value := range entries {
+					entry, ok := value.(map[string]any)
+					if !ok || entry["request_id"] != "history-lease" {
+						continue
+					}
+					leaseRows++
+					if entry["requester_id"] != "test-caller" || entry["holder_id"] != "test-caller" || entry["legacy_unattributed"] != false {
+						t.Errorf("lease audit identity = %#v, want the stored caller ID", entry)
+					}
+				}
+				if leaseRows != 3 {
+					t.Fatalf("lease audit rows = %d, want three caller-attributed grant transitions", leaseRows)
+				}
+			}
 			if tc.name == "limit" && entries[0].(map[string]any)["sequence"] != float64(4) {
 				t.Fatalf("limited history = %#v, want newest sequence four", entries)
 			}
@@ -542,7 +689,7 @@ func TestAutoKeyedCLIInterruptionReturnsItsDurableKey(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	finished := make(chan int, 1)
 	go func() {
-		finished <- runAtSocketContext(ctx, []string{"lease", "request", "--tag", "qa.pool", "--duration", "10s", "--wait", "--wait-timeout", "30s", "--json"}, &stdout, &stderr, path)
+		finished <- runAtSocketContext(ctx, withTestRequesterID([]string{"lease", "request", "--tag", "qa.pool", "--duration", "10s", "--wait", "--wait-timeout", "30s", "--json"}), &stdout, &stderr, path)
 	}()
 	<-queuedSent
 	request := <-requestCh
@@ -589,7 +736,7 @@ func TestAutoKeyedServiceInterruptionPreservesQueuedRequest(t *testing.T) {
 	}, 1)
 	go func() {
 		var stdout, stderr bytes.Buffer
-		code := runAtSocketContext(ctx, []string{"lease", "request", "--tag", "qa.interrupt", "--duration", "10s", "--wait", "--wait-timeout", "20m", "--json"}, &stdout, &stderr, socket)
+		code := runAtSocketContext(ctx, withTestRequesterID([]string{"lease", "request", "--tag", "qa.interrupt", "--duration", "10s", "--wait", "--wait-timeout", "20m", "--json"}), &stdout, &stderr, socket)
 		finished <- struct {
 			code   int
 			stdout string
@@ -722,7 +869,7 @@ func TestStableRefusalExitCodeTable(t *testing.T) {
 	}{
 		{"invalid_json", 2}, {"frame_too_large", 2}, {"unsupported_version", 2}, {"unknown_operation", 2}, {"invalid_request", 2},
 		{"invalid_tag", 2}, {"invalid_resource_id", 2}, {"invalid_lease_id", 2}, {"invalid_request_id", 2}, {"invalid_duration", 2},
-		{"invalid_wait_mode", 2}, {"invalid_wait_timeout", 2}, {"invalid_pool_mode", 2},
+		{"invalid_wait_mode", 2}, {"invalid_wait_timeout", 2}, {"invalid_requester_id", 2}, {"invalid_pool_mode", 2},
 		{"unknown_tag", 3}, {"unknown_resource", 3}, {"unknown_lease", 3}, {"unknown_request", 3},
 		{"request_timed_out", 4}, {"request_cancelled", 4}, {"lease_released", 4}, {"lease_expired", 4},
 		{"duration_exceeds_max", 5}, {"wait_exceeds_max", 5}, {"adapter_required", 5}, {"pool_disabled", 5},
@@ -767,6 +914,50 @@ func TestQueueStatusCLIUsesTheNativeOperation(t *testing.T) {
 		code, rejected := runJSON(t, socket, args...)
 		if code != 2 || rejected.Op != "queue.status" || rejected.State != "error" || rejected.Code != "invalid_request" || len(rejected.Data) != 0 {
 			t.Fatalf("queue status CLI %v = (%d,%#v), want local invalid_request", args, code, rejected)
+		}
+	}
+}
+
+// TestClassResourceAndQueueCommandsUseAllowlistedNativeFields proves class configuration and class status serialize the declared fields while malformed selector forms refuse before transport.
+func TestClassResourceAndQueueCommandsUseAllowlistedNativeFields(t *testing.T) {
+	_, socket := startFixture(t)
+	resourceRequest, err := buildRequest([]string{"resource", "add", "--tag", "mac.jvm-build", "--id", "jvm-cli-01", "--mode", "manual", "--class", "jvm-build", "--requester-id", "opaque:resource-manager", "--json"})
+	if err != nil || resourceRequest.Op != "resource.add" || !reflect.DeepEqual(resourceRequest.Data, map[string]any{"tag": "mac.jvm-build", "resource_id": "jvm-cli-01", "mode": "manual", "class": "jvm-build", "requester_id": "opaque:resource-manager"}) {
+		t.Fatalf("class resource-add request = %#v, %v; want exact class-configured native request", resourceRequest, err)
+	}
+	if code, got := runJSON(t, socket, "resource", "add", "--tag", "mac.jvm-build", "--id", "jvm-cli-01", "--mode", "manual", "--class", "jvm-build", "--json"); code != 0 || got.State != "added" {
+		t.Fatalf("class resource add = (%d,%#v), want added", code, got)
+	}
+	queueRequest, err := buildRequest([]string{"queue", "status", "--class", "jvm-build", "--json"})
+	if err != nil || queueRequest.Op != "queue.status" || !reflect.DeepEqual(queueRequest.Data, map[string]any{"class": "jvm-build"}) {
+		t.Fatalf("class queue-status request = %#v, %v; want class selector", queueRequest, err)
+	}
+	code, got := runJSON(t, socket, "queue", "status", "--class", "jvm-build", "--json")
+	if code != 0 || got.Op != "queue.status" || got.State != "ok" || got.Code != "" || len(got.Data) != 6 || got.Data["class"] != "jvm-build" || got.Data["active_count"] != float64(0) || got.Data["queued_count"] != float64(0) || got.Data["oldest_queued_at"] != nil {
+		t.Fatalf("class queue-status response = (%d,%#v), want empty class snapshot", code, got)
+	}
+	for key := range got.Data {
+		if key != "class" && key != "active_count" && key != "queued_count" && key != "oldest_queued_at" && key != "active_leases" && key != "queued_requests" {
+			t.Fatalf("class queue status exposed unexpected field %q", key)
+		}
+	}
+	if rows, ok := got.Data["active_leases"].([]any); !ok || len(rows) != 0 {
+		t.Fatalf("empty active class rows = %#v, want []", got.Data["active_leases"])
+	}
+	if rows, ok := got.Data["queued_requests"].([]any); !ok || len(rows) != 0 {
+		t.Fatalf("empty queued class rows = %#v, want []", got.Data["queued_requests"])
+	}
+
+	for _, args := range [][]string{
+		{"queue", "status", "--class", "unknown", "--json"},
+		{"queue", "status", "--tag", "qa.pool", "--class", "go-test", "--json"},
+		{"queue", "status", "--json"},
+		{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-01", "--mode", "manual", "--class", "unknown", "--requester-id", "caller", "--json"},
+		{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-02", "--mode", "command", "--class", "go-test", "--requester-id", "caller", "--json"},
+	} {
+		request, err := buildRequest(args)
+		if err == nil || request.Op == "" {
+			t.Errorf("malformed class CLI %v = %#v, %v; want local invalid_request", args, request, err)
 		}
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+	"unicode"
+	"unicode/utf8"
 )
 
 var (
@@ -28,6 +30,79 @@ func validUUID(value string) bool {
 		}
 	}
 	return true
+}
+
+func ValidRequesterID(value string) bool {
+	if !utf8.ValidString(value) || len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validJSONStringUnicode(raw []byte) bool {
+	if !utf8.Valid(raw) || len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return false
+	}
+	for i := 1; i < len(raw)-1; i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw)-1 {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		code, ok := hexCodeUnit(raw[i+1 : i+5])
+		if !ok {
+			return false
+		}
+		i += 4
+		switch {
+		case code >= 0xD800 && code <= 0xDBFF:
+			if i+6 >= len(raw)-1 || raw[i+1] != '\\' || raw[i+2] != 'u' {
+				return false
+			}
+			low, ok := hexCodeUnit(raw[i+3 : i+7])
+			if !ok || low < 0xDC00 || low > 0xDFFF {
+				return false
+			}
+			i += 6
+		case code >= 0xDC00 && code <= 0xDFFF:
+			return false
+		}
+	}
+	return true
+}
+
+func hexCodeUnit(value []byte) (uint16, bool) {
+	if len(value) != 4 {
+		return 0, false
+	}
+	var code uint16
+	for _, b := range value {
+		code <<= 4
+		switch {
+		case b >= '0' && b <= '9':
+			code |= uint16(b - '0')
+		case b >= 'a' && b <= 'f':
+			code |= uint16(b - 'a' + 10)
+		case b >= 'A' && b <= 'F':
+			code |= uint16(b - 'A' + 10)
+		default:
+			return 0, false
+		}
+	}
+	return code, true
 }
 
 func jsonObjectKeysUnique(raw []byte) bool {
@@ -200,11 +275,24 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 	}
 	switch op {
 	case "lease.acquire":
-		if !hasOnlyRequiredOptional(data, []string{"tag", "duration_ns", "wait_mode"}, []string{"wait_timeout_ns"}) {
+		if !hasOnlyRequiredOptional(data, []string{"tag", "duration_ns", "wait_mode"}, []string{"wait_timeout_ns", "requester_id"}) {
 			return invalid("invalid_request", true)
+		}
+		if len(data["requester_id"]) == 0 {
+			return invalid("invalid_requester_id", true)
 		}
 		var input AcquireInput
 		var validType bool
+		if !validJSONStringUnicode(data["requester_id"]) {
+			return invalid("invalid_requester_id", true)
+		}
+		input.RequesterID, validType = jsonStringValue(data["requester_id"])
+		if !validType {
+			return invalid("invalid_request", true)
+		}
+		if !ValidRequesterID(input.RequesterID) {
+			return invalid("invalid_requester_id", true)
+		}
 		input.Tag, validType = jsonStringValue(data["tag"])
 		if !validType {
 			return invalid("invalid_request", true)
@@ -248,10 +336,14 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		state, result, code := s.store.Acquire(input)
 		return state, result, code, responseID, false
 	case "resource.add":
-		if !onlyKeys(data, "tag", "resource_id", "mode") || len(data) != 3 {
+		requesterID, validCaller := requestCallerID(data)
+		if !validCaller {
+			return invalid("invalid_requester_id", false)
+		}
+		if !hasOnlyRequiredOptional(data, []string{"tag", "resource_id", "mode", "requester_id"}, []string{"class"}) {
 			return invalid("invalid_request", false)
 		}
-		var tag, id, mode string
+		var tag, id, mode, class string
 		var validType bool
 		tag, validType = jsonStringValue(data["tag"])
 		if !validType {
@@ -265,6 +357,12 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if !validType {
 			return invalid("invalid_request", false)
 		}
+		if rawClass, present := data["class"]; present {
+			class, validType = jsonStringValue(rawClass)
+			if !validType || !ValidLeaseClass(class) {
+				return invalid("invalid_request", false)
+			}
+		}
 		if !tagIDPattern.MatchString(tag) {
 			return invalid("invalid_tag", false)
 		}
@@ -274,20 +372,28 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if mode != "manual" && mode != "command" {
 			return invalid("invalid_pool_mode", false)
 		}
-		state, result, code := s.store.AddResource(tag, id, mode)
+		state, result, code := s.store.AddResourceWithClass(tag, class, id, mode, requesterID)
 		return state, result, code, "", false
 	case "resource.disable", "resource.enable":
-		if !onlyKeys(data, "resource_id") || len(data) != 1 {
+		requesterID, validCaller := requestCallerID(data)
+		if !validCaller {
+			return invalid("invalid_requester_id", false)
+		}
+		if !onlyKeys(data, "resource_id", "requester_id") || len(data) != 2 {
 			return invalid("invalid_request", false)
 		}
 		id, code := parseResourceID(data["resource_id"])
 		if code != "" {
 			return invalid(code, false)
 		}
-		state, result, code := s.store.SetResource(op, id, false)
+		state, result, code := s.store.SetResource(op, id, false, requesterID)
 		return state, result, code, "", false
 	case "resource.recover":
-		if !onlyKeys(data, "resource_id", "confirm_stopped") || len(data) != 2 {
+		requesterID, validCaller := requestCallerID(data)
+		if !validCaller {
+			return invalid("invalid_requester_id", false)
+		}
+		if !onlyKeys(data, "resource_id", "confirm_stopped", "requester_id") || len(data) != 3 {
 			return invalid("invalid_request", false)
 		}
 		id, validType := jsonStringValue(data["resource_id"])
@@ -304,7 +410,7 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		if !confirm {
 			return invalid("invalid_request", false)
 		}
-		state, result, code := s.store.SetResource(op, id, true)
+		state, result, code := s.store.SetResource(op, id, true, requesterID)
 		return state, result, code, "", false
 	case "lease.release":
 		if !onlyKeys(data, "lease_id") || len(data) != 1 {
@@ -330,14 +436,23 @@ func (s *Server) dispatch(op, requestID string, data map[string]json.RawMessage)
 		}
 		return state, result, code, "", false
 	case "queue.status":
-		if !onlyKeys(data, "tag") || len(data) != 1 {
+		var result map[string]any
+		var code string
+		if len(data) == 1 && onlyKeys(data, "class") {
+			class, validType := jsonStringValue(data["class"])
+			if !validType || !ValidLeaseClass(class) {
+				return invalid("invalid_request", false)
+			}
+			result, code = s.store.ClassQueueStatus(class)
+		} else if len(data) == 1 && onlyKeys(data, "tag") {
+			tag, validType := jsonStringValue(data["tag"])
+			if !validType || !tagIDPattern.MatchString(tag) {
+				return invalid("invalid_request", false)
+			}
+			result, code = s.store.QueueStatus(tag)
+		} else {
 			return invalid("invalid_request", false)
 		}
-		tag, validType := jsonStringValue(data["tag"])
-		if !validType || !tagIDPattern.MatchString(tag) {
-			return invalid("invalid_request", false)
-		}
-		result, code := s.store.QueueStatus(tag)
 		state := "ok"
 		if code != "" {
 			state = "error"
@@ -514,4 +629,13 @@ func parseResourceID(raw json.RawMessage) (string, string) {
 		return "", "invalid_resource_id"
 	}
 	return id, ""
+}
+
+func requestCallerID(data map[string]json.RawMessage) (string, bool) {
+	raw, exists := data["requester_id"]
+	if !exists || !validJSONStringUnicode(raw) {
+		return "", false
+	}
+	requesterID, validType := jsonStringValue(raw)
+	return requesterID, validType && ValidRequesterID(requesterID)
 }

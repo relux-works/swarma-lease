@@ -32,6 +32,13 @@ type parsedFlags struct {
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "launch-agent" {
+		if len(args) != 1 {
+			_, _ = fmt.Fprintln(stderr, "usage: swarma-lease launch-agent")
+			return 2
+		}
+		return writeLaunchAgent(stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "serve" {
 		if len(args) != 1 {
 			return writeCLIError(stdout, "cli", "", "invalid_request")
@@ -102,16 +109,16 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	switch {
 	case args[0] == "resource" && args[1] == "add":
 		request.Op, mode = "resource.add", "resource-add"
-		valueFlags, boolFlags = []string{"--tag", "--id", "--mode"}, []string{"--json"}
+		valueFlags, boolFlags = []string{"--tag", "--id", "--mode", "--requester-id", "--class"}, []string{"--json"}
 	case args[0] == "resource" && (args[1] == "disable" || args[1] == "enable"):
 		request.Op, mode = "resource."+args[1], "resource-one"
-		valueFlags, boolFlags = []string{"--id"}, []string{"--json"}
+		valueFlags, boolFlags = []string{"--id", "--requester-id"}, []string{"--json"}
 	case args[0] == "resource" && args[1] == "recover":
 		request.Op, mode = "resource.recover", "resource-recover"
-		valueFlags, boolFlags = []string{"--id"}, []string{"--confirm-stopped", "--json"}
+		valueFlags, boolFlags = []string{"--id", "--requester-id"}, []string{"--confirm-stopped", "--json"}
 	case args[0] == "lease" && args[1] == "request":
 		request.Op, mode = "lease.acquire", "lease-request"
-		valueFlags, boolFlags = []string{"--tag", "--duration", "--wait-timeout", "--request-id"}, []string{"--wait", "--no-wait", "--json"}
+		valueFlags, boolFlags = []string{"--tag", "--duration", "--wait-timeout", "--request-id", "--requester-id"}, []string{"--wait", "--no-wait", "--json"}
 	case args[0] == "lease" && (args[1] == "wait" || args[1] == "cancel"):
 		request.Op, mode = "lease."+args[1], "lease-key"
 		valueFlags, boolFlags = []string{"--request-id"}, []string{"--json"}
@@ -126,7 +133,7 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		boolFlags = []string{"--json"}
 	case args[0] == "queue" && args[1] == "status":
 		request.Op, mode = "queue.status", "queue-status"
-		valueFlags, boolFlags = []string{"--tag"}, []string{"--json"}
+		valueFlags, boolFlags = []string{"--tag", "--class"}, []string{"--json"}
 	case args[0] == "history":
 		request.Op, mode = "audit.list", "history"
 		valueFlags, boolFlags = []string{"--limit", "--before-sequence"}, []string{"--json"}
@@ -139,12 +146,19 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 	}
 	flags, err := parseFlags(flagArgs, valueFlags, boolFlags)
 	safeRequestID := knownRequestID(mode, flags)
+	if err != nil && requestsCallerID(mode) && flags.hasValue("--requester-id") && flags.values["--requester-id"] == "" {
+		return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_requester_id"}
+	}
 	if err != nil || !flags.bools["--json"] {
 		return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_request"}
 	}
 	data := make(map[string]any)
 	switch mode {
 	case "resource-add":
+		requesterID, commandErr := requiredRequesterID(flags, request.Op, safeRequestID)
+		if commandErr != nil {
+			return lease.WireRequest{}, commandErr
+		}
 		tag := flags.values["--tag"]
 		id := flags.values["--id"]
 		poolMode := flags.values["--mode"]
@@ -157,14 +171,28 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		if poolMode != "manual" && poolMode != "command" {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_pool_mode"}
 		}
-		data["tag"], data["resource_id"], data["mode"] = tag, id, poolMode
+		data["tag"], data["resource_id"], data["mode"], data["requester_id"] = tag, id, poolMode, requesterID
+		if class, present := flags.values["--class"]; present {
+			if !lease.ValidLeaseClass(class) || poolMode != "manual" {
+				return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
+			}
+			data["class"] = class
+		}
 	case "resource-one":
+		requesterID, commandErr := requiredRequesterID(flags, request.Op, safeRequestID)
+		if commandErr != nil {
+			return lease.WireRequest{}, commandErr
+		}
 		id := flags.values["--id"]
 		if !validName(id) {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_resource_id"}
 		}
-		data["resource_id"] = id
+		data["resource_id"], data["requester_id"] = id, requesterID
 	case "resource-recover":
+		requesterID, commandErr := requiredRequesterID(flags, request.Op, safeRequestID)
+		if commandErr != nil {
+			return lease.WireRequest{}, commandErr
+		}
 		id := flags.values["--id"]
 		if !validName(id) {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_resource_id"}
@@ -172,7 +200,7 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 		if !flags.bools["--confirm-stopped"] {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
 		}
-		data["resource_id"], data["confirm_stopped"] = id, true
+		data["resource_id"], data["confirm_stopped"], data["requester_id"] = id, true, requesterID
 	case "lease-request":
 		tag := flags.values["--tag"]
 		if !validName(tag) {
@@ -209,7 +237,12 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request_id"}
 		}
 		request.RequestID = requestID
+		requesterID := flags.values["--requester-id"]
+		if !lease.ValidRequesterID(requesterID) {
+			return lease.WireRequest{}, &commandError{op: request.Op, requestID: safeRequestID, code: "invalid_requester_id"}
+		}
 		data["tag"], data["duration_ns"], data["wait_mode"] = tag, duration, waitMode
+		data["requester_id"] = requesterID
 		if waitTimeout != nil {
 			data["wait_timeout_ns"] = *waitTimeout
 		}
@@ -261,14 +294,42 @@ func buildRequest(args []string) (lease.WireRequest, *commandError) {
 			data["before_sequence"] = parsed
 		}
 	case "queue-status":
-		tag := flags.values["--tag"]
-		if !validName(tag) {
+		tag, hasTag := flags.values["--tag"]
+		class, hasClass := flags.values["--class"]
+		if hasTag == hasClass {
 			return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
 		}
-		data["tag"] = tag
+		if hasClass {
+			if !lease.ValidLeaseClass(class) {
+				return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
+			}
+			data["class"] = class
+		} else {
+			if !validName(tag) {
+				return lease.WireRequest{}, &commandError{op: request.Op, code: "invalid_request"}
+			}
+			data["tag"] = tag
+		}
 	}
 	request.Data = data
 	return request, nil
+}
+
+func requestsCallerID(mode string) bool {
+	switch mode {
+	case "lease-request", "resource-add", "resource-one", "resource-recover":
+		return true
+	default:
+		return false
+	}
+}
+
+func requiredRequesterID(flags parsedFlags, op, requestID string) (string, *commandError) {
+	requesterID, ok := flags.values["--requester-id"]
+	if !ok || !lease.ValidRequesterID(requesterID) {
+		return "", &commandError{op: op, requestID: requestID, code: "invalid_requester_id"}
+	}
+	return requesterID, nil
 }
 
 func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
@@ -312,12 +373,20 @@ func parseFlags(args, valueNames, boolNames []string) (parsedFlags, error) {
 		if !hasInline {
 			if i+1 >= len(args) {
 				invalid = true
+				result.values[name] = ""
+				continue
+			}
+			nextName, _, _ := strings.Cut(args[i+1], "=")
+			if valuesAllowed[nextName] || boolAllowed[nextName] {
+				invalid = true
+				result.values[name] = ""
 				continue
 			}
 			i++
 			value = args[i]
 		}
 		if value == "" {
+			result.values[name] = value
 			invalid = true
 			continue
 		}

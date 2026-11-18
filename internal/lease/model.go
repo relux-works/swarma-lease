@@ -8,10 +8,27 @@ import (
 const (
 	maxLeaseNS        = int64(20 * time.Minute)
 	maxWaitNS         = int64(4 * time.Hour)
-	schemaVersion     = int64(2)
+	schemaV1Version   = int64(1)
+	schemaV2Version   = int64(2)
+	schemaVersion     = int64(3)
 	schemaV1MaxWaitNS = int64(30 * time.Minute)
 	dateLayout        = "2006-01-02T15:04:05.000000000Z"
 )
+
+func ValidLeaseClass(value string) bool {
+	return value == "go-test" || value == "jvm-build"
+}
+
+func mappedLeaseClass(tag string) *string {
+	switch tag {
+	case "mac.go-test-manual":
+		return stringPtr("go-test")
+	case "mac.jvm-build":
+		return stringPtr("jvm-build")
+	default:
+		return nil
+	}
+}
 
 type Config struct {
 	StateDir   string
@@ -30,21 +47,50 @@ type Response struct {
 }
 
 type RequestRecord struct {
-	RequestID     string  `json:"request_id"`
-	Tag           string  `json:"tag"`
-	DurationNS    int64   `json:"duration_ns"`
-	WaitMode      string  `json:"wait_mode"`
-	WaitTimeout   *int64  `json:"wait_timeout_ns"`
-	QueueSequence *int64  `json:"queue_sequence"`
-	QueuedAt      *string `json:"queued_at"`
-	WaitDeadline  *string `json:"wait_deadline_at"`
-	State         string  `json:"state"`
-	OutcomeCode   *string `json:"outcome_code"`
+	RequestID          string  `json:"request_id"`
+	RequesterID        *string `json:"requester_id"`
+	LegacyUnattributed bool    `json:"legacy_unattributed"`
+	Tag                string  `json:"tag"`
+	Class              *string `json:"-"`
+	DurationNS         int64   `json:"duration_ns"`
+	WaitMode           string  `json:"wait_mode"`
+	WaitTimeout        *int64  `json:"wait_timeout_ns"`
+	QueueSequence      *int64  `json:"queue_sequence"`
+	ClassQueueSequence *int64  `json:"-"`
+	QueuedAt           *string `json:"queued_at"`
+	WaitDeadline       *string `json:"wait_deadline_at"`
+	State              string  `json:"state"`
+	OutcomeCode        *string `json:"outcome_code"`
+}
+
+type ClassActiveLease struct {
+	HolderID  *string `json:"holder_id"`
+	State     string  `json:"state"`
+	GrantedAt string  `json:"granted_at"`
+	HardEndAt string  `json:"hard_end_at"`
+}
+
+type ClassQueuedRequest struct {
+	RequesterID    *string `json:"requester_id"`
+	State          string  `json:"state"`
+	QueuedAt       string  `json:"queued_at"`
+	WaitDeadlineAt string  `json:"wait_deadline_at"`
+}
+
+type ClassQueueStatus struct {
+	Class          string               `json:"class"`
+	ActiveCount    int64                `json:"active_count"`
+	QueuedCount    int64                `json:"queued_count"`
+	OldestQueuedAt *string              `json:"oldest_queued_at"`
+	ActiveLeases   []ClassActiveLease   `json:"active_leases"`
+	QueuedRequests []ClassQueuedRequest `json:"queued_requests"`
 }
 
 type LeaseRecord struct {
 	ID                 string  `json:"id"`
 	RequestID          string  `json:"request_id"`
+	HolderID           *string `json:"holder_id"`
+	LegacyUnattributed bool    `json:"legacy_unattributed"`
 	Tag                string  `json:"tag"`
 	ResourceID         string  `json:"resource_id"`
 	State              string  `json:"state"`
@@ -84,14 +130,23 @@ type Counts struct {
 }
 
 type AuditEntry struct {
-	Sequence   int64   `json:"sequence"`
-	At         string  `json:"at"`
-	Operation  string  `json:"operation"`
-	RequestID  *string `json:"request_id"`
-	TargetID   *string `json:"target_id"`
-	ResultCode string  `json:"result_code"`
-	FromState  *string `json:"from_state"`
-	ToState    *string `json:"to_state"`
+	Sequence           int64   `json:"sequence"`
+	At                 string  `json:"at"`
+	Operation          string  `json:"operation"`
+	ActorKind          string  `json:"actor_kind"`
+	ActorComponent     *string `json:"actor_component"`
+	Cause              *string `json:"cause"`
+	CauseRefKind       *string `json:"cause_ref_kind"`
+	CauseRefID         *string `json:"cause_ref_id"`
+	Origin             *string `json:"origin"`
+	RequestID          *string `json:"request_id"`
+	RequesterID        *string `json:"requester_id"`
+	HolderID           *string `json:"holder_id"`
+	LegacyUnattributed bool    `json:"legacy_unattributed"`
+	TargetID           *string `json:"target_id"`
+	ResultCode         string  `json:"result_code"`
+	FromState          *string `json:"from_state"`
+	ToState            *string `json:"to_state"`
 }
 
 type socketRequest struct {

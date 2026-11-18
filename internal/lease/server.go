@@ -421,11 +421,7 @@ func RunDefault(ctx context.Context) error {
 }
 
 func DefaultSocketPath() (string, error) {
-	uid := os.Geteuid()
-	if uid == 0 {
-		return "", errUnsafePath
-	}
-	home, err := homeForUID(uid)
+	home, err := DefaultHomeDir()
 	if err != nil {
 		return "", err
 	}
@@ -434,6 +430,15 @@ func DefaultSocketPath() (string, error) {
 		return "", errSocketPathTooLong
 	}
 	return path, nil
+}
+
+// DefaultHomeDir returns the system-account home directory for the effective user.
+func DefaultHomeDir() (string, error) {
+	uid := os.Geteuid()
+	if uid == 0 {
+		return "", errUnsafePath
+	}
+	return homeForUID(uid)
 }
 
 func defaultSocketPath(home string) string {

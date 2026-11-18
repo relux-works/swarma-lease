@@ -454,10 +454,10 @@ func TestReviewSchedulerGrantOverflow(t *testing.T) {
 func TestReviewWrongFieldTypes(t *testing.T) {
 	s := newDirectTestServer(t)
 	for _, tc := range []struct{ name, data string }{
-		{"tag", `{"tag":7,"duration_ns":1,"wait_mode":"no_wait"}`},
-		{"duration", `{"tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}`},
-		{"mode", `{"tag":"qa.pool","duration_ns":1,"wait_mode":7}`},
-		{"timeout", `{"tag":"qa.pool","duration_ns":1,"wait_mode":"wait","wait_timeout_ns":"1"}`},
+		{"tag", `{"requester_id":"test-caller","tag":7,"duration_ns":1,"wait_mode":"no_wait"}`},
+		{"duration", `{"requester_id":"test-caller","tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}`},
+		{"mode", `{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":7}`},
+		{"timeout", `{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":"wait","wait_timeout_ns":"1"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, _ := s.handleBytes([]byte(`{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":`+tc.data+`}`), uint32(s.ownerUID))
@@ -496,33 +496,33 @@ func TestReviewFieldTypesPrecedeValueGrammar(t *testing.T) {
 		},
 		{
 			name:     "data-type-before-request-id-grammar",
-			raw:      `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}}`,
+			raw:      `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}}`,
 			wantCode: "invalid_request",
 		},
 		{
 			name:          "acquire-type-before-tag-grammar",
-			raw:           `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-order-acquire","data":{"tag":"qa.bad!","duration_ns":"1","wait_mode":"no_wait"}}`,
+			raw:           `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-order-acquire","data":{"requester_id":"test-caller","tag":"qa.bad!","duration_ns":"1","wait_mode":"no_wait"}}`,
 			wantCode:      "invalid_request",
 			wantRequestID: "type-order-acquire",
 		},
 		{
 			name:     "resource-add-type-before-tag-grammar",
-			raw:      `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.bad!","resource_id":7,"mode":"manual"}}`,
+			raw:      `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.bad!","resource_id":7,"mode":"manual"}}`,
 			wantCode: "invalid_request",
 		},
 		{
 			name:     "recover-type-before-resource-id-grammar",
-			raw:      `{"version":1,"type":"request","op":"resource.recover","data":{"resource_id":"bad!","confirm_stopped":"yes"}}`,
+			raw:      `{"version":1,"type":"request","op":"resource.recover","data":{"requester_id":"test-caller","resource_id":"bad!","confirm_stopped":"yes"}}`,
 			wantCode: "invalid_request",
 		},
 		{
 			name:     "request-id-grammar-after-valid-fields",
-			raw:      `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"tag":"qa.pool","duration_ns":1,"wait_mode":"no_wait"}}`,
+			raw:      `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":"no_wait"}}`,
 			wantCode: "invalid_request_id",
 		},
 		{
 			name:          "valid-types-preserve-tag-refusal",
-			raw:           `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-order-control","data":{"tag":"qa.bad!","duration_ns":1,"wait_mode":"no_wait"}}`,
+			raw:           `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-order-control","data":{"requester_id":"test-caller","tag":"qa.bad!","duration_ns":1,"wait_mode":"no_wait"}}`,
 			wantCode:      "invalid_tag",
 			wantRequestID: "type-order-control",
 		},

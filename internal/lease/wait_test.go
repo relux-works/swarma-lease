@@ -62,6 +62,11 @@ func (c *retryTestClock) recoverAndAdvance(delta time.Duration) {
 
 func openQueuedObserver(t *testing.T, server *Server, op, requestID string, data map[string]any) (*waitObserver, Response) {
 	t.Helper()
+	if op == "lease.acquire" || op == "resource.add" || op == "resource.disable" || op == "resource.enable" || op == "resource.recover" {
+		if _, ok := data["requester_id"]; !ok {
+			data["requester_id"] = "test-caller"
+		}
+	}
 	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: server.socketPath, Net: "unix"})
 	if err != nil {
 		t.Fatalf("dial service for %s: %v", op, err)
@@ -106,6 +111,11 @@ func (o *waitObserver) readEvent(t *testing.T) TerminalEvent {
 
 func directRequest(t *testing.T, server *Server, op, requestID string, data map[string]any) Response {
 	t.Helper()
+	if op == "lease.acquire" {
+		if _, ok := data["requester_id"]; !ok {
+			data["requester_id"] = "test-caller"
+		}
+	}
 	message := map[string]any{"version": 1, "type": "request", "op": op, "data": data}
 	if requestID != "" {
 		message["request_id"] = requestID
@@ -159,7 +169,7 @@ func TestUnknownWaitAndCancelPreserveState(t *testing.T) {
 }
 
 func waitData(tag string, timeout time.Duration) map[string]any {
-	return map[string]any{"tag": tag, "duration_ns": int64(60 * time.Second), "wait_mode": "wait", "wait_timeout_ns": int64(timeout)}
+	return map[string]any{"requester_id": "test-caller", "tag": tag, "duration_ns": int64(60 * time.Second), "wait_mode": "wait", "wait_timeout_ns": int64(timeout)}
 }
 
 func requestSequence(t *testing.T, result map[string]any) int64 {

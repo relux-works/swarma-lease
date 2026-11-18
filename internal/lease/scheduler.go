@@ -7,6 +7,43 @@ import (
 	"github.com/relux-works/swarma-lease/internal/sqlite"
 )
 
+type leaseClassPolicy struct {
+	priority   int64
+	maxActive  int64
+	maxLeaseNS int64
+}
+
+func loadLeaseClassPolicy(tx *sqlite.Tx, class string) (leaseClassPolicy, error) {
+	rows, err := tx.Query("SELECT priority,max_active,max_lease_ns FROM lease_classes WHERE class=?", class)
+	if err != nil || len(rows) != 1 {
+		return leaseClassPolicy{}, sqlite.ErrStorage
+	}
+	policy := leaseClassPolicy{priority: rowInt(rows[0], "priority"), maxActive: rowInt(rows[0], "max_active"), maxLeaseNS: rowInt(rows[0], "max_lease_ns")}
+	if policy.priority < 0 || policy.maxActive < 1 || policy.maxLeaseNS <= 0 {
+		return leaseClassPolicy{}, sqlite.ErrStorage
+	}
+	return policy, nil
+}
+
+func classCanGrant(tx *sqlite.Tx, class string) (bool, error) {
+	policy, err := loadLeaseClassPolicy(tx, class)
+	if err != nil {
+		return false, err
+	}
+	active, err := activeClassLeaseCount(tx, class)
+	if err != nil {
+		return false, err
+	}
+	if active >= policy.maxActive {
+		return false, nil
+	}
+	blocked, err := hasHigherPriorityQueue(tx, policy.priority)
+	if err != nil {
+		return false, err
+	}
+	return !blocked, nil
+}
+
 func (s *Store) scheduleTx(tx *sqlite.Tx, sample Sample, operation string, events *[]TerminalEvent) error {
 	if err := s.applyDue(tx, sample, operation, events); err != nil {
 		return err
@@ -18,7 +55,7 @@ func (s *Store) scheduleTx(tx *sqlite.Tx, sample Sample, operation string, event
 }
 
 func (s *Store) scheduleQueued(tx *sqlite.Tx, sample Sample, events *[]TerminalEvent) error {
-	tags, err := tx.Query("SELECT DISTINCT tag FROM requests WHERE state='queued' ORDER BY tag COLLATE BINARY")
+	tags, err := tx.Query("SELECT DISTINCT r.tag FROM requests r JOIN pools p ON p.tag=r.tag WHERE r.state='queued' AND p.class IS NULL ORDER BY r.tag COLLATE BINARY")
 	if err != nil {
 		return err
 	}
@@ -41,7 +78,7 @@ func (s *Store) scheduleQueued(tx *sqlite.Tx, sample Sample, events *[]TerminalE
 			}
 			requestID := rowString(requests[0], "request_id")
 			request, err := requestByID(tx, requestID)
-			if err != nil || request == nil {
+			if err != nil || request == nil || request.Class != nil {
 				return sqlite.ErrStorage
 			}
 			resource, err := loadResource(tx, rowString(resources[0], "id"))
@@ -58,7 +95,86 @@ func (s *Store) scheduleQueued(tx *sqlite.Tx, sample Sample, events *[]TerminalE
 			*events = append(*events, *event)
 		}
 	}
+	classes, err := tx.Query("SELECT class,priority,max_active FROM lease_classes ORDER BY priority DESC,class COLLATE BINARY")
+	if err != nil {
+		return err
+	}
+	for _, classRow := range classes {
+		class := rowString(classRow, "class")
+		priority := rowInt(classRow, "priority")
+		maxActive := rowInt(classRow, "max_active")
+		if !ValidLeaseClass(class) || priority < 0 || maxActive < 1 {
+			return sqlite.ErrStorage
+		}
+		for {
+			blocked, err := hasHigherPriorityQueue(tx, priority)
+			if err != nil {
+				return err
+			}
+			if blocked {
+				break
+			}
+			active, err := activeClassLeaseCount(tx, class)
+			if err != nil {
+				return err
+			}
+			if active >= maxActive {
+				break
+			}
+			requests, err := tx.Query("SELECT request_id,tag,class_queue_sequence FROM requests WHERE class=? AND state='queued' ORDER BY class_queue_sequence,request_id COLLATE BINARY LIMIT 1", class)
+			if err != nil {
+				return err
+			}
+			if len(requests) == 0 {
+				break
+			}
+			classSequence := nullableInt(requests[0], "class_queue_sequence")
+			if classSequence == nil || *classSequence < 1 {
+				return sqlite.ErrStorage
+			}
+			requestID := rowString(requests[0], "request_id")
+			request, err := requestByID(tx, requestID)
+			if err != nil || request == nil || request.Class == nil || *request.Class != class || request.Tag != rowString(requests[0], "tag") || request.ClassQueueSequence == nil || *request.ClassQueueSequence != *classSequence {
+				return sqlite.ErrStorage
+			}
+			resources, err := tx.Query("SELECT r.id FROM resources r JOIN pools p ON p.tag=r.tag WHERE p.class=? AND r.tag=? AND r.state='available' ORDER BY r.id COLLATE BINARY LIMIT 1", class, request.Tag)
+			if err != nil {
+				return err
+			}
+			if len(resources) == 0 {
+				break
+			}
+			resource, err := loadResource(tx, rowString(resources[0], "id"))
+			if err != nil {
+				return err
+			}
+			if err := grantRequest(tx, sample, *request, resource, "scheduler", stringPtr("queued")); err != nil {
+				return err
+			}
+			event, _, err := terminalEvent(tx, requestID)
+			if err != nil || event == nil {
+				return sqlite.ErrStorage
+			}
+			*events = append(*events, *event)
+		}
+	}
 	return nil
+}
+
+func activeClassLeaseCount(tx *sqlite.Tx, class string) (int64, error) {
+	rows, err := tx.Query("SELECT COUNT(*) AS n FROM leases l JOIN requests r ON r.request_id=l.request_id WHERE r.class=? AND l.state='active'", class)
+	if err != nil || len(rows) != 1 {
+		return 0, sqlite.ErrStorage
+	}
+	return rowInt(rows[0], "n"), nil
+}
+
+func hasHigherPriorityQueue(tx *sqlite.Tx, priority int64) (bool, error) {
+	rows, err := tx.Query("SELECT r.request_id FROM requests r JOIN lease_classes c ON c.class=r.class WHERE r.state='queued' AND c.priority>? LIMIT 1", priority)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 func disableAllExhaustedResources(tx *sqlite.Tx, sample Sample) error {
@@ -204,7 +320,7 @@ func (s *Store) Cancel(requestID string) (string, map[string]any, string) {
 }
 
 func (s *Store) enqueueRequest(tx *sqlite.Tx, in AcquireInput, sample Sample, state, code *string, data *map[string]any) error {
-	pool, err := tx.Query("SELECT next_queue_sequence FROM pools WHERE tag=?", in.Tag)
+	pool, err := tx.Query("SELECT class,next_queue_sequence FROM pools WHERE tag=?", in.Tag)
 	if err != nil || len(pool) != 1 {
 		return sqlite.ErrStorage
 	}
@@ -212,7 +328,23 @@ func (s *Store) enqueueRequest(tx *sqlite.Tx, in AcquireInput, sample Sample, st
 	if sequence <= 0 {
 		return sqlite.ErrStorage
 	}
-	if sequence == math.MaxInt64 {
+	class := nullableString(pool[0], "class")
+	var classSequence any
+	var nextClassSequence int64
+	if class != nil {
+		classRows, err := tx.Query("SELECT next_queue_sequence FROM lease_classes WHERE class=?", *class)
+		if err != nil || len(classRows) != 1 {
+			return sqlite.ErrStorage
+		}
+		nextClassSequence = rowInt(classRows[0], "next_queue_sequence")
+		if nextClassSequence <= 0 {
+			return sqlite.ErrStorage
+		}
+		if nextClassSequence != math.MaxInt64 {
+			classSequence = nextClassSequence
+		}
+	}
+	if sequence == math.MaxInt64 || class != nil && nextClassSequence == math.MaxInt64 {
 		return s.refuse(tx, in, sample, "queue_sequence_exhausted", state, code, data)
 	}
 	if in.WaitTimeoutNS == nil || *in.WaitTimeoutNS <= 0 || sample.MonotonicNS < 0 || *in.WaitTimeoutNS > math.MaxInt64-sample.MonotonicNS {
@@ -224,7 +356,12 @@ func (s *Store) enqueueRequest(tx *sqlite.Tx, in AcquireInput, sample Sample, st
 	if _, err := tx.Exec("UPDATE pools SET next_queue_sequence=? WHERE tag=? AND next_queue_sequence=?", sequence+1, in.Tag, sequence); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',NULL,?,?)", in.RequestID, in.Tag, in.DurationNS, in.WaitMode, *in.WaitTimeoutNS, sequence, queuedAt, waitDeadlineAt, sample.BootSessionID, sample.MonotonicNS, deadline, queuedAt, queuedAt); err != nil {
+	if class != nil {
+		if _, err := tx.Exec("UPDATE lease_classes SET next_queue_sequence=? WHERE class=? AND next_queue_sequence=?", nextClassSequence+1, *class, nextClassSequence); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,class,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,class_queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,0,?,?,?,?,?,?,?, ?,?,?,?,?,?,'queued',NULL,?,?)", in.RequestID, in.RequesterID, in.Tag, nullableSQLString(class), in.DurationNS, in.WaitMode, *in.WaitTimeoutNS, sequence, classSequence, queuedAt, waitDeadlineAt, sample.BootSessionID, sample.MonotonicNS, deadline, queuedAt, queuedAt); err != nil {
 		return err
 	}
 	if err := insertAudit(tx, sample, "lease.acquire", &in.RequestID, &in.RequestID, "ok", nil, stringPtr("queued")); err != nil {
@@ -240,6 +377,9 @@ func (s *Store) enqueueRequest(tx *sqlite.Tx, in AcquireInput, sample Sample, st
 }
 
 func grantRequest(tx *sqlite.Tx, sample Sample, request RequestRecord, resource ResourceRecord, operation string, requestFrom *string) error {
+	if (operation == "scheduler" && requestFrom == nil) || (operation == "lease.acquire" && requestFrom != nil) || (operation != "scheduler" && operation != "lease.acquire") {
+		return sqlite.ErrStorage
+	}
 	if resource.State != "available" || resource.FencingToken == math.MaxInt64 || sample.MonotonicNS < 0 || request.DurationNS > math.MaxInt64-sample.MonotonicNS {
 		return sqlite.ErrStorage
 	}
@@ -256,7 +396,7 @@ func grantRequest(tx *sqlite.Tx, sample Sample, request RequestRecord, resource 
 		if request.WaitTimeout != nil {
 			waitTimeout = *request.WaitTimeout
 		}
-		if _, err := tx.Exec("INSERT INTO requests(request_id,tag,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,'leased',NULL,?,?)", request.RequestID, request.Tag, request.DurationNS, request.WaitMode, waitTimeout, grantedAt, grantedAt); err != nil {
+		if _, err := tx.Exec("INSERT INTO requests(request_id,requester_id,legacy_unattributed,tag,class,duration_ns,wait_mode,wait_timeout_ns,queue_sequence,class_queue_sequence,queued_at,wait_deadline_at,queue_boot_session_id,queue_started_monotonic_ns,wait_deadline_monotonic_ns,state,outcome_code,created_at,updated_at) VALUES(?,?,?, ?,?,?,?, ?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'leased',NULL,?,?)", request.RequestID, nullableSQLString(request.RequesterID), boolInt(request.LegacyUnattributed), request.Tag, nullableSQLString(request.Class), request.DurationNS, request.WaitMode, waitTimeout, grantedAt, grantedAt); err != nil {
 			return err
 		}
 	} else {
@@ -267,16 +407,25 @@ func grantRequest(tx *sqlite.Tx, sample Sample, request RequestRecord, resource 
 	if _, err := tx.Exec("UPDATE resources SET state='leased',fencing_token=?,updated_at=? WHERE id=? AND state='available'", fencingToken, grantedAt, resource.ID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("INSERT INTO leases(id,request_id,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token) VALUES(?,?,?,'active',?,?,?,?,?,?,?,NULL,NULL,NULL)", leaseID, request.RequestID, resource.ID, request.DurationNS, grantedAt, hardEndAt, sample.BootSessionID, sample.MonotonicNS, hardEndMono, fencingToken); err != nil {
+	if _, err := tx.Exec("INSERT INTO leases(id,request_id,holder_id,legacy_unattributed,resource_id,state,duration_ns,granted_at,hard_end_at,boot_session_id,granted_monotonic_ns,hard_end_monotonic_ns,fencing_token,ended_at,ended_resource_state,ended_fencing_token) VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,NULL,NULL,NULL)", leaseID, request.RequestID, nullableSQLString(request.RequesterID), boolInt(request.LegacyUnattributed), resource.ID, request.DurationNS, grantedAt, hardEndAt, sample.BootSessionID, sample.MonotonicNS, hardEndMono, fencingToken); err != nil {
 		return err
 	}
-	if err := insertAudit(tx, sample, operation, &request.RequestID, &request.RequestID, "ok", requestFrom, stringPtr("leased")); err != nil {
+	requestID := request.RequestID
+	if operation == "scheduler" {
+		if err := insertAuditSystem(tx, sample, operation, "promotion", stringPtr("request"), &requestID, &requestID, &requestID, "ok", requestFrom, stringPtr("leased")); err != nil {
+			return err
+		}
+	} else if err := insertAudit(tx, sample, operation, &requestID, &requestID, "ok", nil, stringPtr("leased")); err != nil {
 		return err
 	}
-	if err := insertAudit(tx, sample, operation, &request.RequestID, &leaseID, "ok", nil, stringPtr("active")); err != nil {
+	grantCause := "grant"
+	if operation == "scheduler" {
+		grantCause = "promotion"
+	}
+	if err := insertAuditSystem(tx, sample, "scheduler", grantCause, stringPtr("request"), &requestID, &requestID, &leaseID, "ok", nil, stringPtr("active")); err != nil {
 		return err
 	}
-	if err := insertAudit(tx, sample, operation, &request.RequestID, &resource.ID, "ok", stringPtr("available"), stringPtr("leased")); err != nil {
+	if err := insertAuditSystem(tx, sample, "scheduler", grantCause, stringPtr("request"), &requestID, &requestID, &resource.ID, "ok", stringPtr("available"), stringPtr("leased")); err != nil {
 		return err
 	}
 	return nil
@@ -288,6 +437,13 @@ func auditSequence(tx *sqlite.Tx) (int64, error) {
 		return 0, sqlite.ErrStorage
 	}
 	return rowInt(rows[0], "sequence"), nil
+}
+
+func boolInt(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) nextWakeDelay(sample Sample) (time.Duration, bool, error) {

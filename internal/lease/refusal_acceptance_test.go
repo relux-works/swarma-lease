@@ -74,7 +74,7 @@ func TestEarlyVersionRefusalsPreserveOnlyValidRequestKeys(t *testing.T) {
 		},
 		{
 			name: "invalid-key-grammar-still-refuses",
-			raw:  `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"tag":7,"duration_ns":1,"wait_mode":"no_wait"}}`,
+			raw:  `{"version":1,"type":"request","op":"lease.acquire","request_id":"bad/id","data":{"requester_id":"test-caller","tag":7,"duration_ns":1,"wait_mode":"no_wait"}}`,
 			op:   "lease.acquire", code: "invalid_request",
 		},
 	}
@@ -118,10 +118,10 @@ func TestEarlyVersionRefusalsPreserveOnlyValidRequestKeys(t *testing.T) {
 			t.Fatalf("early refusal reserved %s: %s", requestID, code)
 		}
 	}
-	if added, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.version","resource_id":"version-control","mode":"manual"}}`); added.State != "added" || added.Code != "" {
+	if added, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.version","resource_id":"version-control","mode":"manual"}}`); added.State != "added" || added.Code != "" {
 		t.Fatalf("valid resource control = %#v, want added", added)
 	}
-	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"version-control","data":{"tag":"qa.version","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
+	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"version-control","data":{"requester_id":"test-caller","tag":"qa.version","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
 	if granted.State != "granted" || granted.Code != "" || granted.RequestID != "version-control" || granted.Data["lease"] == nil || granted.Data["resource"] == nil {
 		t.Fatalf("valid acquisition control = %#v, want granted lease and resource", granted)
 	}
@@ -130,11 +130,11 @@ func TestEarlyVersionRefusalsPreserveOnlyValidRequestKeys(t *testing.T) {
 // TestStateDependentRefusalsSerializeEmptyObjects proves six management refusals emit exact data:{} frames and leave audit state untouched, while a matching valid add/acquire control still succeeds.
 func TestStateDependentRefusalsSerializeEmptyObjects(t *testing.T) {
 	server := newTestServer(t)
-	added, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`)
+	added, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`)
 	if added.State != "added" || added.Code != "" {
 		t.Fatalf("resource setup = %#v, want added", added)
 	}
-	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-holder","data":{"tag":"qa.refusal","duration_ns":60000000000,"wait_mode":"no_wait"}}`)
+	granted, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-holder","data":{"requester_id":"test-caller","tag":"qa.refusal","duration_ns":60000000000,"wait_mode":"no_wait"}}`)
 	if granted.State != "granted" || granted.Code != "" {
 		t.Fatalf("active resource setup = %#v, want grant", granted)
 	}
@@ -142,12 +142,12 @@ func TestStateDependentRefusalsSerializeEmptyObjects(t *testing.T) {
 	cases := []struct {
 		name, raw, op, code string
 	}{
-		{"duplicate-resource", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`, "resource.add", "duplicate_resource_id"},
-		{"pool-mode-mismatch", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-02","mode":"command"}}`, "resource.add", "pool_mode_mismatch"},
-		{"unknown-resource-disable", `{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":"missing-resource"}}`, "resource.disable", "unknown_resource"},
-		{"unknown-resource-enable", `{"version":1,"type":"request","op":"resource.enable","data":{"resource_id":"missing-resource"}}`, "resource.enable", "unknown_resource"},
+		{"duplicate-resource", `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.refusal","resource_id":"refusal-01","mode":"manual"}}`, "resource.add", "duplicate_resource_id"},
+		{"pool-mode-mismatch", `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.refusal","resource_id":"refusal-02","mode":"command"}}`, "resource.add", "pool_mode_mismatch"},
+		{"unknown-resource-disable", `{"version":1,"type":"request","op":"resource.disable","data":{"requester_id":"test-caller","resource_id":"missing-resource"}}`, "resource.disable", "unknown_resource"},
+		{"unknown-resource-enable", `{"version":1,"type":"request","op":"resource.enable","data":{"requester_id":"test-caller","resource_id":"missing-resource"}}`, "resource.enable", "unknown_resource"},
 		{"unknown-lease-release", `{"version":1,"type":"request","op":"lease.release","data":{"lease_id":"00000000000000000000000000000002"}}`, "lease.release", "unknown_lease"},
-		{"invalid-transition", `{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":"refusal-01"}}`, "resource.disable", "invalid_transition"},
+		{"invalid-transition", `{"version":1,"type":"request","op":"resource.disable","data":{"requester_id":"test-caller","resource_id":"refusal-01"}}`, "resource.disable", "invalid_transition"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -176,11 +176,11 @@ func TestStateDependentRefusalsSerializeEmptyObjects(t *testing.T) {
 		})
 	}
 
-	control, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.refusal","resource_id":"refusal-02","mode":"manual"}}`)
+	control, _ := exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.refusal","resource_id":"refusal-02","mode":"manual"}}`)
 	if control.State != "added" || control.Code != "" {
 		t.Fatalf("valid resource control = %#v, want added", control)
 	}
-	control, _ = exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-control","data":{"tag":"qa.refusal","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
+	control, _ = exchangeRawServiceRequest(t, server, `{"version":1,"type":"request","op":"lease.acquire","request_id":"refusal-control","data":{"requester_id":"test-caller","tag":"qa.refusal","duration_ns":1000000000,"wait_mode":"no_wait"}}`)
 	if control.State != "granted" || control.Code != "" || control.RequestID != "refusal-control" {
 		t.Fatalf("valid acquisition control = %#v, want grant", control)
 	}

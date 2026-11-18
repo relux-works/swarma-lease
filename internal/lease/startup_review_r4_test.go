@@ -108,7 +108,7 @@ func TestInvalidDatabasePreservesProvenStaleSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open fixture database: %v", err)
 	}
-	if err := db.ExecScript("PRAGMA user_version=3;"); err != nil {
+	if err := db.ExecScript("PRAGMA user_version=4;"); err != nil {
 		_ = db.Close()
 		t.Fatalf("set incompatible fixture version: %v", err)
 	}

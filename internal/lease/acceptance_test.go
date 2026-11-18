@@ -38,17 +38,17 @@ func TestCanonicalV1DatabaseMigratesAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("fixture active request = %s/%s, want leased", activeState, code)
 	}
 	activeLease, ok := active["lease"].(LeaseRecord)
-	if !ok || activeLease.ID != "00000000000000000000000000000001" || activeLease.FencingToken != 5 {
-		t.Fatalf("fixture active lease = %#v, want token five and the fixture ID", active["lease"])
+	if !ok || activeLease.ID != "00000000000000000000000000000001" || activeLease.FencingToken != 5 || activeLease.HolderID != nil || !activeLease.LegacyUnattributed {
+		t.Fatalf("fixture active lease = %#v, want token five, the fixture ID, and an unattributed legacy identity", active["lease"])
 	}
 	queuedState, queued, code := server.store.Status("fixture-queued", "")
 	queuedRequest, requestOK := queued["request"].(*RequestRecord)
-	if code != "" || queuedState != "queued" || !requestOK || queuedRequest.QueueSequence == nil || *queuedRequest.QueueSequence != 7 {
+	if code != "" || queuedState != "queued" || !requestOK || queuedRequest.QueueSequence == nil || *queuedRequest.QueueSequence != 7 || queuedRequest.RequesterID != nil || !queuedRequest.LegacyUnattributed {
 		t.Fatalf("fixture queued request = %s/%#v/%s, want original sequence seven", queuedState, queued["request"], code)
 	}
 	terminalState, terminal, code := server.store.Status("fixture-terminal", "")
 	terminalRequest, terminalOK := terminal["request"].(*RequestRecord)
-	if code != "" || terminalState != "timed_out" || !terminalOK || stringValue(terminalRequest.OutcomeCode) != "request_timed_out" {
+	if code != "" || terminalState != "timed_out" || !terminalOK || stringValue(terminalRequest.OutcomeCode) != "request_timed_out" || terminalRequest.RequesterID != nil || !terminalRequest.LegacyUnattributed {
 		t.Fatalf("fixture terminal request = %s/%#v/%s, want original timed-out outcome", terminalState, terminal["request"], code)
 	}
 	sequenceRows, err := server.store.db.Query("SELECT next_queue_sequence FROM pools WHERE tag='qa.fixture'")
@@ -59,7 +59,16 @@ func TestCanonicalV1DatabaseMigratesAndSurvivesRestart(t *testing.T) {
 	if err != nil || len(initialAuditRows) != 1 || rowInt(initialAuditRows[0], "n") != 4 {
 		t.Fatalf("migrated audit history = %#v, %v; want four preserved rows", initialAuditRows, err)
 	}
-	_, _, code = server.store.AddResource("qa.persistence", "persisted-01", "manual")
+	legacyAuditRows, err := server.store.db.Query("SELECT sequence,requester_id,holder_id,legacy_unattributed FROM audit ORDER BY sequence")
+	if err != nil || len(legacyAuditRows) != 4 {
+		t.Fatalf("migrated audit identity rows = %#v, %v; want four rows", legacyAuditRows, err)
+	}
+	for _, row := range legacyAuditRows {
+		if row["requester_id"] != nil || row["holder_id"] != nil || rowInt(row, "legacy_unattributed") != 1 {
+			t.Errorf("v1 audit row = %#v, want explicit legacy attribution with no invented caller", row)
+		}
+	}
+	_, _, code = server.store.AddResource("qa.persistence", "persisted-01", "manual", "test-caller")
 	if code != "" {
 		t.Fatalf("add persistence control resource: %s", code)
 	}
@@ -92,7 +101,7 @@ func TestInvalidCanonicalDatabasesArePreserved(t *testing.T) {
 	for _, tc := range []struct {
 		name, mutation, want string
 	}{
-		{"unknown-user-version", "PRAGMA user_version=3;", "state_incompatible"},
+		{"unknown-user-version", "PRAGMA user_version=4;", "state_incompatible"},
 		{"schema-version-mismatch", "PRAGMA user_version=2;", "state_incompatible"},
 		{"missing-index", "DROP INDEX requests_tag_queue_sequence;", "state_incompatible"},
 		{"extra-object", "CREATE TABLE unexpected(value INTEGER);", "state_incompatible"},
@@ -261,20 +270,20 @@ func TestWrongFieldTypesRefuseWithoutPersistence(t *testing.T) {
 	cases := []struct {
 		name, raw, requestID string
 	}{
-		{"acquire-tag", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"tag":7,"duration_ns":1,"wait_mode":"no_wait"}}`, "type-01"},
-		{"acquire-duration", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}}`, "type-01"},
-		{"acquire-mode", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"tag":"qa.pool","duration_ns":1,"wait_mode":7}}`, "type-01"},
-		{"acquire-timeout", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"tag":"qa.pool","duration_ns":1,"wait_mode":"wait","wait_timeout_ns":"1"}}`, "type-01"},
-		{"acquire-key-type", `{"version":1,"type":"request","op":"lease.acquire","request_id":7,"data":{"tag":"qa.pool","duration_ns":1,"wait_mode":"no_wait"}}`, ""},
+		{"acquire-tag", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"requester_id":"test-caller","tag":7,"duration_ns":1,"wait_mode":"no_wait"}}`, "type-01"},
+		{"acquire-duration", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":"1","wait_mode":"no_wait"}}`, "type-01"},
+		{"acquire-mode", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":7}}`, "type-01"},
+		{"acquire-timeout", `{"version":1,"type":"request","op":"lease.acquire","request_id":"type-01","data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":"wait","wait_timeout_ns":"1"}}`, "type-01"},
+		{"acquire-key-type", `{"version":1,"type":"request","op":"lease.acquire","request_id":7,"data":{"requester_id":"test-caller","tag":"qa.pool","duration_ns":1,"wait_mode":"no_wait"}}`, ""},
 		{"version-type", `{"version":"1","type":"request","op":"service.status","data":{}}`, ""},
 		{"message-type", `{"version":1,"type":7,"op":"service.status","data":{}}`, ""},
 		{"data-type", `{"version":1,"type":"request","op":"service.status","data":[]}`, ""},
-		{"resource-tag", `{"version":1,"type":"request","op":"resource.add","data":{"tag":7,"resource_id":"qa-01","mode":"manual"}}`, ""},
-		{"resource-id", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.pool","resource_id":7,"mode":"manual"}}`, ""},
-		{"resource-mode", `{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.pool","resource_id":"qa-01","mode":true}}`, ""},
-		{"disable-id", `{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":7}}`, ""},
-		{"recover-confirmation", `{"version":1,"type":"request","op":"resource.recover","data":{"resource_id":"missing-01","confirm_stopped":false}}`, ""},
-		{"recover-confirmation-type", `{"version":1,"type":"request","op":"resource.recover","data":{"resource_id":"missing-01","confirm_stopped":"true"}}`, ""},
+		{"resource-tag", `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":7,"resource_id":"qa-01","mode":"manual"}}`, ""},
+		{"resource-id", `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.pool","resource_id":7,"mode":"manual"}}`, ""},
+		{"resource-mode", `{"version":1,"type":"request","op":"resource.add","data":{"requester_id":"test-caller","tag":"qa.pool","resource_id":"qa-01","mode":true}}`, ""},
+		{"disable-id", `{"version":1,"type":"request","op":"resource.disable","data":{"requester_id":"test-caller","resource_id":7}}`, ""},
+		{"recover-confirmation", `{"version":1,"type":"request","op":"resource.recover","data":{"requester_id":"test-caller","resource_id":"missing-01","confirm_stopped":false}}`, ""},
+		{"recover-confirmation-type", `{"version":1,"type":"request","op":"resource.recover","data":{"requester_id":"test-caller","resource_id":"missing-01","confirm_stopped":"true"}}`, ""},
 		{"release-id", `{"version":1,"type":"request","op":"lease.release","data":{"lease_id":7}}`, ""},
 		{"status-request-id", `{"version":1,"type":"request","op":"lease.status","data":{"request_id":7}}`, ""},
 		{"status-lease-id", `{"version":1,"type":"request","op":"lease.status","data":{"lease_id":7}}`, ""},
@@ -307,7 +316,7 @@ func TestWrongFieldTypesRefuseWithoutPersistence(t *testing.T) {
 func TestRejectedInputIsNotEchoedOrPersisted(t *testing.T) {
 	server := newDirectTestServer(t)
 	const marker = "private/rejected/value"
-	raw := []byte(`{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-01","data":{"tag":"private/rejected/value","duration_ns":1,"wait_mode":"no_wait"}}`)
+	raw := []byte(`{"version":1,"type":"request","op":"lease.acquire","request_id":"privacy-01","data":{"requester_id":"test-caller","tag":"private/rejected/value","duration_ns":1,"wait_mode":"no_wait"}}`)
 	got, _ := server.handleBytes(raw, uint32(server.ownerUID))
 	encoded, err := json.Marshal(got)
 	if err != nil {

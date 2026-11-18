@@ -73,6 +73,15 @@ func shortTestDir(t *testing.T) string {
 
 func request(t *testing.T, server *Server, peer uint32, v any) Response {
 	t.Helper()
+	if message, ok := v.(map[string]any); ok {
+		op, _ := message["op"].(string)
+		needsCaller := op == "lease.acquire" || op == "resource.add" || op == "resource.disable" || op == "resource.enable" || op == "resource.recover"
+		if data, ok := message["data"].(map[string]any); ok && needsCaller {
+			if _, exists := data["requester_id"]; !exists {
+				data["requester_id"] = "test-caller"
+			}
+		}
+	}
 	raw, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
@@ -278,6 +287,88 @@ func TestResourceControlAndRecoveryTransitions(t *testing.T) {
 	}
 }
 
+// TestResourceMutationsRequireAndAuditCaller proves missing callers cause no resource or audit writes for all four resource operations, while caller-backed positive controls preserve separate empty parents.
+func TestResourceMutationsRequireAndAuditCaller(t *testing.T) {
+	server := newTestServer(t)
+	uid := uint32(server.ownerUID)
+	auditCount := func() int64 {
+		t.Helper()
+		rows, err := server.store.db.Query("SELECT COUNT(*) AS n FROM audit")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read audit count = %#v, %v", rows, err)
+		}
+		return rowInt(rows[0], "n")
+	}
+	resourceState := func(id string) any {
+		t.Helper()
+		rows, err := server.store.db.Query("SELECT state FROM resources WHERE id=?", id)
+		if err != nil {
+			t.Fatalf("read resource %q: %v", id, err)
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		return rows[0]["state"]
+	}
+	missingCaller := func(raw string, op string) int64 {
+		t.Helper()
+		before := auditCount()
+		got, _ := exchangeRawServiceRequest(t, server, raw)
+		if got.State != "error" || got.Code != "invalid_requester_id" || auditCount() != before {
+			t.Fatalf("%s without caller = %#v, audits %d -> %d; want invalid_requester_id and no audit write", op, got, before, auditCount())
+		}
+		return before
+	}
+
+	missingCaller(`{"version":1,"type":"request","op":"resource.add","data":{"tag":"qa.callers","resource_id":"manual-call","mode":"manual"}}`, "resource.add")
+	if resourceState("manual-call") != nil {
+		t.Fatalf("resource.add without caller created a resource: state=%v", resourceState("manual-call"))
+	}
+	if got := directRequest(t, server, "resource.add", "", map[string]any{"tag": "qa.callers", "resource_id": "manual-call", "mode": "manual"}); got.State != "added" {
+		t.Fatalf("caller-backed resource.add = %#v, want added", got)
+	}
+
+	missingCaller(`{"version":1,"type":"request","op":"resource.disable","data":{"resource_id":"manual-call"}}`, "resource.disable")
+	if resourceState("manual-call") != "available" {
+		t.Fatalf("resource.disable without caller changed resource: state=%v", resourceState("manual-call"))
+	}
+	if got := directRequest(t, server, "resource.disable", "", map[string]any{"resource_id": "manual-call"}); got.State != "disabled" {
+		t.Fatalf("caller-backed resource.disable = %#v, want disabled", got)
+	}
+
+	missingCaller(`{"version":1,"type":"request","op":"resource.enable","data":{"resource_id":"manual-call"}}`, "resource.enable")
+	if resourceState("manual-call") != "disabled" {
+		t.Fatalf("resource.enable without caller changed resource: state=%v", resourceState("manual-call"))
+	}
+	if got := directRequest(t, server, "resource.enable", "", map[string]any{"resource_id": "manual-call"}); got.State != "enabled" {
+		t.Fatalf("caller-backed resource.enable = %#v, want enabled", got)
+	}
+
+	if got := directRequest(t, server, "resource.add", "", map[string]any{"tag": "qa.callers", "resource_id": "command-call", "mode": "command"}); got.State != "added" {
+		t.Fatalf("caller-backed command resource.add = %#v, want added", got)
+	}
+	if _, err := server.store.db.Exec("UPDATE resources SET state='quarantined' WHERE id=?", "command-call"); err != nil {
+		t.Fatalf("seed quarantined command resource: %v", err)
+	}
+	missingCaller(`{"version":1,"type":"request","op":"resource.recover","data":{"resource_id":"command-call","confirm_stopped":true}}`, "resource.recover")
+	if resourceState("command-call") != "quarantined" {
+		t.Fatalf("resource.recover without caller changed resource: state=%v", resourceState("command-call"))
+	}
+	if got := directRequest(t, server, "resource.recover", "", map[string]any{"resource_id": "command-call", "confirm_stopped": true}); got.State != "recovered" {
+		t.Fatalf("caller-backed resource.recover = %#v, want recovered", got)
+	}
+
+	rows, err := server.store.db.Query("SELECT operation,request_id,requester_id,holder_id,legacy_unattributed FROM audit WHERE operation LIKE 'resource.%' ORDER BY sequence")
+	if err != nil || len(rows) != 5 {
+		t.Fatalf("resource audit rows = %#v, %v; want two adds plus disable, enable and recover", rows, err)
+	}
+	for _, row := range rows {
+		if row["request_id"] != nil || row["requester_id"] != "test-caller" || row["holder_id"] != nil || rowInt(row, "legacy_unattributed") != 0 {
+			t.Errorf("resource audit row = %#v; want caller=test-caller, empty parent, no holder, and v3 attribution", row)
+		}
+	}
+}
+
 // TestRestartRecoversProvenStaleSocketAndPreservesLiveSocket proves wrong-mode stale sockets are refused without removal, same-inode mode-correct stale sockets recover, and connectable sockets remain untouched.
 func TestRestartRecoversProvenStaleSocketAndPreservesLiveSocket(t *testing.T) {
 	root := shortTestDir(t)
@@ -286,7 +377,7 @@ func TestRestartRecoversProvenStaleSocketAndPreservesLiveSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start initial service: %v", err)
 	}
-	if state, _, code := first.store.AddResource("qa.persist", "persist-01", "manual"); code != "" || state != "added" {
+	if state, _, code := first.store.AddResource("qa.persist", "persist-01", "manual", "test-caller"); code != "" || state != "added" {
 		t.Fatalf("persist resource before restart = (%s, %s), want added", state, code)
 	}
 	if err := first.Close(); err != nil {
