@@ -959,8 +959,7 @@ func TestClassResourceAndQueueCommandsUseAllowlistedNativeFields(t *testing.T) {
 		{args: []string{"resource", "add", "--tag", "qa.pool", "--id", "bad-class-02", "--mode", "command", "--class", "go-test", "--requester-id", "caller", "--json"}, op: "resource.add"},
 	} {
 		request, err := buildRequest(tc.args)
-		commandErr, ok := err.(*commandError)
-		if !ok || commandErr.code != "invalid_request" || commandErr.op != tc.op || request.Op != "" {
+		if err == nil || err.code != "invalid_request" || err.op != tc.op || request.Op != "" {
 			t.Errorf("malformed class CLI %v = %#v, %v; want local %s invalid_request and no wire request", tc.args, request, err, tc.op)
 		}
 	}
