@@ -132,6 +132,80 @@ func TestClassQueueKeepsRequestTagResourceEligibility(t *testing.T) {
 	}
 }
 
+// TestClassDirectGrantDoesNotBypassUnavailableClassHead proves a no-wait request cannot overtake an older same-class waiter blocked by its tag; it also checks re-promotion and direct grants after the queue drains.
+func TestClassDirectGrantDoesNotBypassUnavailableClassHead(t *testing.T) {
+	server, _ := startQueueStatusFixture(t, newControlledLeaseClock(hardEndBaseSample()))
+	addClassPolicyResource(t, server, "mac.go-test-manual", "a-go-resource", "go-test")
+	addClassPolicyResource(t, server, "mac.go-test-extra", "z-go-resource", "go-test")
+
+	holderState, holderData, holderCode := acquireClassPolicyRequest(t, server, "request-go-holder", "opaque:active/go", "mac.go-test-manual", time.Minute, "no_wait", 0)
+	if holderState != "granted" || holderCode != "" {
+		t.Fatalf("class holder = %s/%s, want grant", holderState, holderCode)
+	}
+	holder := classPolicyLease(t, holderData)
+
+	waiterState, _, waiterCode := acquireClassPolicyRequest(t, server, "request-go-older-b", "opaque:queued/go-b", "mac.go-test-extra", time.Minute, "wait", time.Hour)
+	if waiterState != "queued" || waiterCode != "" {
+		t.Fatalf("older tag-B waiter = %s/%s, want queued", waiterState, waiterCode)
+	}
+	if state, _, code := server.store.SetResource("resource.disable", "z-go-resource", false, "test-caller"); state != "disabled" || code != "" {
+		t.Fatalf("disable tag-B resource = %s/%s, want disabled", state, code)
+	}
+	releaseClassPolicyLease(t, server, holder)
+	if state, request, lease := statusClassRequest(t, server, "request-go-older-b"); state != "queued" || request == nil || lease != nil {
+		t.Fatalf("older tag-B waiter after holder release = %s/%#v/%#v, want queued without a lease", state, request, lease)
+	}
+
+	youngerState, _, youngerCode := acquireClassPolicyRequest(t, server, "request-go-younger-a", "opaque:queued/go-a", "mac.go-test-manual", time.Minute, "no_wait", 0)
+	if youngerState != "error" || youngerCode != "no_wait_busy" || leaseCount(t, server, "request-go-younger-a") != 0 {
+		t.Fatalf("younger tag-A direct request = %s/%s leases=%d, want no_wait_busy with no lease", youngerState, youngerCode, leaseCount(t, server, "request-go-younger-a"))
+	}
+	queue, queueCode := server.store.ClassQueueStatus("go-test")
+	if queueCode != "" || queue["active_count"] != int64(0) || queue["queued_count"] != int64(1) {
+		t.Fatalf("class queue after refused direct request = %#v/%s, want older waiter preserved and no active lease", queue, queueCode)
+	}
+
+	if state, _, code := server.store.SetResource("resource.enable", "z-go-resource", false, "test-caller"); state != "enabled" || code != "" {
+		t.Fatalf("enable tag-B resource = %s/%s, want enabled", state, code)
+	}
+	state, _, lease := statusClassRequest(t, server, "request-go-older-b")
+	if state != "leased" || lease == nil || lease.ResourceID != "z-go-resource" {
+		t.Fatalf("older tag-B waiter after resource returns = %s/%#v, want the tag-B lease", state, lease)
+	}
+	releaseClassPolicyLease(t, server, *lease)
+
+	controlState, controlData, controlCode := acquireClassPolicyRequest(t, server, "request-go-direct-control", "opaque:direct/go", "mac.go-test-manual", time.Minute, "no_wait", 0)
+	if controlState != "granted" || controlCode != "" || classPolicyLease(t, controlData).ResourceID != "a-go-resource" {
+		t.Fatalf("direct request after class queue drains = %s/%s %#v, want tag-A grant", controlState, controlCode, controlData)
+	}
+}
+
+// TestClassDirectGrantIgnoresLowerPriorityQueueFromOtherClass proves a queued Go waiter does not block a direct JVM grant when the JVM class has no queued head.
+func TestClassDirectGrantIgnoresLowerPriorityQueueFromOtherClass(t *testing.T) {
+	server, _ := startQueueStatusFixture(t, newControlledLeaseClock(hardEndBaseSample()))
+	addClassPolicyResource(t, server, "mac.go-test-manual", "a-go-resource", "go-test")
+	addClassPolicyResource(t, server, "mac.go-test-extra", "z-go-resource", "go-test")
+	addClassPolicyResource(t, server, "mac.jvm-build", "jvm-resource", "jvm-build")
+
+	holderState, holderData, holderCode := acquireClassPolicyRequest(t, server, "request-go-holder", "opaque:active/go", "mac.go-test-manual", time.Minute, "no_wait", 0)
+	if holderState != "granted" || holderCode != "" {
+		t.Fatalf("Go class holder = %s/%s, want grant", holderState, holderCode)
+	}
+	waiterState, _, waiterCode := acquireClassPolicyRequest(t, server, "request-go-older", "opaque:queued/go", "mac.go-test-extra", time.Minute, "wait", time.Hour)
+	if waiterState != "queued" || waiterCode != "" {
+		t.Fatalf("Go class waiter = %s/%s, want queued", waiterState, waiterCode)
+	}
+
+	jvmState, jvmData, jvmCode := acquireClassPolicyRequest(t, server, "request-jvm-direct", "opaque:direct/jvm", "mac.jvm-build", time.Minute, "no_wait", 0)
+	if jvmState != "granted" || jvmCode != "" || classPolicyLease(t, jvmData).ResourceID != "jvm-resource" {
+		t.Fatalf("JVM direct request with lower-priority Go waiter = %s/%s %#v, want JVM grant", jvmState, jvmCode, jvmData)
+	}
+	if state, request, lease := statusClassRequest(t, server, "request-go-older"); state != "queued" || request == nil || lease != nil {
+		t.Fatalf("Go waiter after JVM direct grant = %s/%#v/%#v, want preserved queue", state, request, lease)
+	}
+	releaseClassPolicyLease(t, server, classPolicyLease(t, holderData))
+}
+
 // TestClassQueuePriorityFIFOAndNoPreemption proves build waiters block new Go grants without changing a running Go lease, and both class queues promote in FIFO order.
 func TestClassQueuePriorityFIFOAndNoPreemption(t *testing.T) {
 	server, _ := startQueueStatusFixture(t, newControlledLeaseClock(hardEndBaseSample()))

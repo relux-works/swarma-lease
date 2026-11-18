@@ -37,11 +37,26 @@ func classCanGrant(tx *sqlite.Tx, class string) (bool, error) {
 	if active >= policy.maxActive {
 		return false, nil
 	}
+	queued, err := hasClassQueue(tx, class)
+	if err != nil {
+		return false, err
+	}
+	if queued {
+		return false, nil
+	}
 	blocked, err := hasHigherPriorityQueue(tx, policy.priority)
 	if err != nil {
 		return false, err
 	}
 	return !blocked, nil
+}
+
+func hasClassQueue(tx *sqlite.Tx, class string) (bool, error) {
+	rows, err := tx.Query("SELECT request_id FROM requests WHERE class=? AND state='queued' LIMIT 1", class)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 func (s *Store) scheduleTx(tx *sqlite.Tx, sample Sample, operation string, events *[]TerminalEvent) error {
